@@ -7,6 +7,7 @@ interface Props {
   transaction: TransactionDraft;
   onConfirm: (t: TransactionDraft) => void;
   onEdit: (t: TransactionDraft) => void;
+  onCancelDraft?: () => void;
   onReject?: (t: TransactionDraft) => void;
   onDelete?: (t: TransactionDraft) => void;
   confirmationNeeded?: boolean;
@@ -277,6 +278,7 @@ export function TransactionCard({
   transaction,
   onConfirm,
   onEdit,
+  onCancelDraft,
   onReject,
   onDelete,
   confirmationNeeded,
@@ -285,6 +287,7 @@ export function TransactionCard({
 }: Props) {
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [draftCancelled, setDraftCancelled] = useState(false);
   const [draft, setDraft] = useState<TransactionDraft>(() => ({
     ...transaction,
     merchant: cleanValue(transaction.merchant) ?? null,
@@ -416,6 +419,11 @@ export function TransactionCard({
     });
   };
 
+  const handleCancelDraft = () => {
+    setDraftCancelled(true);
+    onCancelDraft?.();
+  };
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
@@ -436,32 +444,44 @@ export function TransactionCard({
             {draft.type}
           </span>
         </div>
-        {onDelete && draft.id && (
-          confirmDelete ? (
-            <div className="flex items-center gap-1.5 shrink-0">
-              <button
-                onClick={() => onDelete(draft)}
-                className="text-[10px] font-medium bg-destructive text-destructive-foreground px-2 py-1 rounded hover:opacity-90 transition-opacity"
-              >
-                Confirm
-              </button>
-              <button
-                onClick={() => setConfirmDelete(false)}
-                className="text-[10px] font-medium bg-muted text-muted-foreground px-2 py-1 rounded hover:opacity-90 transition-opacity"
-              >
-                Cancel
-              </button>
-            </div>
-          ) : (
+        <div className="flex items-center gap-1.5 shrink-0">
+          {confirmationNeeded && onCancelDraft && !draftCancelled && (
             <button
-              onClick={() => setConfirmDelete(true)}
+              onClick={handleCancelDraft}
               className="text-muted-foreground hover:text-destructive hover:bg-destructive/10 p-1.5 rounded-md transition-colors"
-              title="Delete this transaction"
+              title="Cancel this draft"
+              aria-label="Cancel this draft"
             >
-              <Trash2 className="w-4 h-4" />
+              <X className="w-4 h-4" />
             </button>
-          )
-        )}
+          )}
+          {onDelete && draft.id && (
+            confirmDelete ? (
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  onClick={() => onDelete(draft)}
+                  className="text-[10px] font-medium bg-destructive text-destructive-foreground px-2 py-1 rounded hover:opacity-90 transition-opacity"
+                >
+                  Confirm
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  className="text-[10px] font-medium bg-muted text-muted-foreground px-2 py-1 rounded hover:opacity-90 transition-opacity"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                className="text-muted-foreground hover:text-destructive hover:bg-destructive/10 p-1.5 rounded-md transition-colors"
+                title="Delete this transaction"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )
+          )}
+        </div>
       </div>
 
       {/* ── VIEW MODE ── */}
@@ -524,7 +544,7 @@ export function TransactionCard({
               />
             </div>
 
-            {confirmationNeeded && (
+            {confirmationNeeded && !draftCancelled && (
               <ConfirmationBox
                 assumedFields={assumed}
                 assumptionOptions={assumptionOptions}
@@ -535,6 +555,10 @@ export function TransactionCard({
                 onReject={onReject ? () => onReject({ ...draft, confirmed: false }) : undefined}
                 showReject={!!allowRejectAssumptions}
               />
+            )}
+
+            {confirmationNeeded && draftCancelled && (
+              <p className="text-xs text-muted-foreground mt-3">Entry cancelled.</p>
             )}
           </motion.div>
         ) : (

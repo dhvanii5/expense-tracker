@@ -147,6 +147,18 @@ export default function Index() {
     });
   }, []);
 
+  const handleCancelDraft = useCallback(() => {
+    setPendingDraft(null);
+    setSessionData(null);
+    setFollowupField(null);
+    addMessage({
+      id: crypto.randomUUID(),
+      role: 'ai',
+      content: 'No problem, I cancelled this entry. You can start a new one anytime.',
+      timestamp: new Date(),
+    });
+  }, []);
+
   return (
     <div className="flex h-screen bg-background overflow-hidden">
       {/* Main Chat Area */}
@@ -178,6 +190,7 @@ export default function Index() {
               message={msg}
               onConfirm={handleConfirm}
               onEdit={handleEdit}
+              onCancelDraft={handleCancelDraft}
               onSuggestionClick={handleSend}
             />
           ))}
@@ -185,7 +198,12 @@ export default function Index() {
         </div>
 
         {/* Input */}
-        <ChatInput onSend={handleSend} disabled={typing} />
+        <ChatInput
+          onSend={handleSend}
+          onCancelEntry={handleCancelDraft}
+          canCancelEntry={!!pendingDraft || !!followupField || !!sessionData}
+          disabled={typing}
+        />
       </div>
 
       {/* Right Sidebar - Recent Transactions */}

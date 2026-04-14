@@ -8,12 +8,13 @@ interface Props {
   message: ChatMessage;
   onConfirm: (t: TransactionDraft) => void;
   onEdit: (t: TransactionDraft) => void;
+  onCancelDraft?: () => void;
   onReject?: (t: TransactionDraft) => void;
   onDelete?: (t: TransactionDraft) => void;
   onSuggestionClick: (s: string) => void;
 }
 
-export function ChatBubble({ message, onConfirm, onEdit, onReject, onDelete, onSuggestionClick }: Props) {
+export function ChatBubble({ message, onConfirm, onEdit, onCancelDraft, onReject, onDelete, onSuggestionClick }: Props) {
   const isUser = message.role === 'user';
   const showQueryAnswer = message.queryResult && message.queryResult.answer !== message.content;
 
@@ -70,6 +71,7 @@ export function ChatBubble({ message, onConfirm, onEdit, onReject, onDelete, onS
               confirmationNeeded={message.confirmationNeeded}
               assumptionOptions={message.assumptionOptions}
               allowRejectAssumptions={message.allowRejectAssumptions}
+              onCancelDraft={message.confirmationNeeded ? onCancelDraft : undefined}
             />
           )}
 
@@ -86,6 +88,7 @@ export function ChatBubble({ message, onConfirm, onEdit, onReject, onDelete, onS
                   confirmationNeeded={message.confirmationNeeded}
                   assumptionOptions={message.assumptionOptions}
                   allowRejectAssumptions={message.allowRejectAssumptions}
+                  onCancelDraft={message.confirmationNeeded ? onCancelDraft : undefined}
                 />
               ))}
             </div>

@@ -1,12 +1,14 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send } from 'lucide-react';
+import { Send, X } from 'lucide-react';
 
 interface Props {
   onSend: (text: string) => void;
+  onCancelEntry?: () => void;
+  canCancelEntry?: boolean;
   disabled?: boolean;
 }
 
-export function ChatInput({ onSend, disabled }: Props) {
+export function ChatInput({ onSend, onCancelEntry, canCancelEntry, disabled }: Props) {
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -30,7 +32,20 @@ export function ChatInput({ onSend, disabled }: Props) {
 
   return (
     <div className="border-t bg-card/80 backdrop-blur-sm px-4 py-3">
-      <div className="max-w-2xl mx-auto flex items-end gap-2">
+      <div className="max-w-2xl mx-auto space-y-2">
+        {canCancelEntry && onCancelEntry && (
+          <div className="flex justify-end">
+            <button
+              onClick={onCancelEntry}
+              className="inline-flex items-center gap-1.5 text-xs bg-muted text-muted-foreground px-2.5 py-1.5 rounded-md hover:bg-muted/80 transition-colors"
+              title="Cancel current entry"
+              aria-label="Cancel current entry"
+            >
+              <X className="w-3 h-3" /> Cancel entry
+            </button>
+          </div>
+        )}
+        <div className="flex items-end gap-2">
         <textarea
           ref={inputRef}
           value={value}
@@ -48,6 +63,7 @@ export function ChatInput({ onSend, disabled }: Props) {
         >
           <Send className="w-4 h-4" />
         </button>
+        </div>
       </div>
     </div>
   );
