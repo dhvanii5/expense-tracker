@@ -13,11 +13,13 @@ import os
 import ollama
 import chromadb
 from sentence_transformers import SentenceTransformer
+from llama_cpp import Llama
 
 # ── Global variables for models and db ─────────────────────────────────────────
 embed_model = None
 chroma_client = None
 collection = None
+llm = None
 
 
 @asynccontextmanager
@@ -28,6 +30,16 @@ async def lifespan(app: FastAPI):
     collection = chroma_client.get_or_create_collection(
         "transactions", metadata={"hf:space": "cosine"}
     )
+    
+    print(f"Loading local LLM from {MODEL_PATH} ...")
+    llm = Llama(
+        model_path=MODEL_PATH,
+        n_ctx=384,
+        n_batch=128,
+        n_gpu_layers=0,
+        verbose=False,
+    )
+    print("✅ Local LLM ready")
     yield
 
 
@@ -40,7 +52,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL = os.getenv("OLLAMA_MODEL", "Qwen2.5-1.5B-Instruct.Q4_K_M")
+MODEL_PATH = "d:/expense tracker/model/expense_1.5b.Q4_K_M.gguf"
+CHATML_TEMPLATE = "<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
 
 OLLAMA_FAST_OPTIONS = {
     "num_predict": 80,  # reduce from 128 — JSON output is short
@@ -126,7 +139,7 @@ OPTIONAL_FIELDS = ["category", "currency", "item", "merchant", "remarks", "bill_
 
 OPTIONAL_FOLLOWUP_FIELDS = {
     "expense": ["merchant", "payment_method", "bill_no"],
-    "income": ["payment_method", "payer", "bill_no"],
+    "income": ["payment_method", "payer"],
 }
 
 SKIP_ANSWER_TOKENS = {"skip", "none", "na", "n/a", "no", "not now", "later"}
@@ -207,38 +220,127 @@ MONTHS = {
 # Used by: infer_expense_category(), prepare_chat_outcome(), extract_category()
 CATEGORY_KEYWORDS = {
     "Groceries": [
-        "grocery", "groceries", "vegetable", "vegetables", "veggies",
-        "kirana", "rice", "dal", "fruits", "atta", "flour", "oil",
-        "sugar", "milk", "bread", "eggs",
+        "grocery",
+        "groceries",
+        "vegetable",
+        "vegetables",
+        "veggies",
+        "kirana",
+        "rice",
+        "dal",
+        "fruits",
+        "atta",
+        "flour",
+        "oil",
+        "sugar",
+        "milk",
+        "bread",
+        "eggs",
     ],
     "Food": [
-        "food", "lunch", "dinner", "breakfast", "coffee", "tea",
-        "snack", "pizza", "burger", "biryani", "meal", "cafe",
-        "restaurant", "zomato", "swiggy",
+        "food",
+        "lunch",
+        "dinner",
+        "breakfast",
+        "coffee",
+        "tea",
+        "snack",
+        "pizza",
+        "burger",
+        "biryani",
+        "meal",
+        "cafe",
+        "restaurant",
+        "zomato",
+        "swiggy",
     ],
     "Transport": [
-        "petrol", "diesel", "fuel", "uber", "ola", "cab", "taxi",
-        "auto", "bus", "train", "metro", "flight", "ticket",
-        "rapido", "ride", "travel", "commute",
+        "petrol",
+        "diesel",
+        "fuel",
+        "uber",
+        "ola",
+        "cab",
+        "taxi",
+        "auto",
+        "bus",
+        "train",
+        "metro",
+        "flight",
+        "ticket",
+        "rapido",
+        "ride",
+        "travel",
+        "commute",
     ],
     "Health": [
-        "medicine", "medicines", "pharmacy", "doctor", "hospital",
-        "gym", "workout", "fitness", "lab", "test", "clinic",
-        "tablet", "tablets", "pills", "vitamins", "supplements", "health",
+        "medicine",
+        "medicines",
+        "pharmacy",
+        "doctor",
+        "hospital",
+        "gym",
+        "workout",
+        "fitness",
+        "lab",
+        "test",
+        "clinic",
+        "tablet",
+        "tablets",
+        "pills",
+        "vitamins",
+        "supplements",
+        "health",
     ],
     "Entertainment": [
-        "subscription", "netflix", "spotify", "hotstar", "prime",
-        "movie", "cinema", "ott", "gaming", "stream", "tickets",
+        "subscription",
+        "netflix",
+        "spotify",
+        "hotstar",
+        "prime",
+        "movie",
+        "cinema",
+        "ott",
+        "gaming",
+        "stream",
+        "tickets",
     ],
     "Shopping": [
-        "shopping", "clothes", "clothing", "shoe", "shoes", "sneakers",
-        "shirt", "tshirt", "dress", "watch", "bag", "jeans", "kurta",
-        "jacket", "cap", "accessories",
-        "amazon", "flipkart", "myntra", "nykaa", "ajio", "croma",
+        "shopping",
+        "clothes",
+        "clothing",
+        "shoe",
+        "shoes",
+        "sneakers",
+        "shirt",
+        "tshirt",
+        "dress",
+        "watch",
+        "bag",
+        "jeans",
+        "kurta",
+        "jacket",
+        "cap",
+        "accessories",
+        "amazon",
+        "flipkart",
+        "myntra",
+        "nykaa",
+        "ajio",
+        "croma",
     ],
     "Bills": [
-        "bill", "electricity", "water", "recharge", "rent",
-        "internet", "mobile recharge", "utility", "wifi", "gas", "broadband",
+        "bill",
+        "electricity",
+        "water",
+        "recharge",
+        "rent",
+        "internet",
+        "mobile recharge",
+        "utility",
+        "wifi",
+        "gas",
+        "broadband",
     ],
     "Education": ["education", "tuition", "course", "school", "college", "books"],
     "Travel": ["travel", "hotel", "booking", "airbnb", "holiday", "trip"],
@@ -360,50 +462,77 @@ def coerce_amount(val) -> Optional[float]:
 
 def coerce_datetime(val, user_input: str) -> Optional[str]:
     """Normalize datetime to ISO-like output using value or user-input hints."""
-    if val is None:
+    def parse_relative_datetime_hint(text: str) -> Optional[str]:
+        lower = (text or "").lower()
+        now = datetime.now()
+
+        if "today" in lower or "now" in lower or "just now" in lower:
+            return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        if "yesterday" in lower:
+            return (now - timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+        if "tomorrow" in lower:
+            return (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+        if "this week" in lower:
+            return (now - timedelta(days=now.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+
+        # Tolerates common typos like "dayss back" / "weekss ago".
+        days_ago = re.search(r"\b(\d+)\s+day(?:s|ss)?\s+(ago|back)\b", lower)
+        if days_ago:
+            return (now - timedelta(days=int(days_ago.group(1)))).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+
+        weeks_ago = re.search(r"\b(\d+)\s+week(?:s|ss)?\s+(ago|back)\b", lower)
+        if weeks_ago:
+            return (now - timedelta(weeks=int(weeks_ago.group(1)))).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+
+        weekdays = [
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+        ]
+        for idx, day_name in enumerate(weekdays):
+            if f"last {day_name}" in lower:
+                days_behind = (now.weekday() - idx) % 7 or 7
+                return (now - timedelta(days=days_behind)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).isoformat()
+
         return None
-    if isinstance(val, str):
-        text = val.strip()
+
+    for raw_text in [val, user_input]:
+        if not isinstance(raw_text, str):
+            continue
+        text = raw_text.strip()
+        if not text:
+            continue
         if text.lower() in FILLER_VALUES:
-            return None
+            continue
+
         if re.match(r"\d{4}-\d{2}-\d{2}", text):
             return text
 
         lower = text.lower()
-        if "today" in lower or "now" in lower:
-            return (
-                datetime.now()
-                .replace(hour=0, minute=0, second=0, microsecond=0)
-                .isoformat()
-            )
-        if "yesterday" in lower:
-            return (
-                (datetime.now() - timedelta(days=1))
-                .replace(hour=0, minute=0, second=0, microsecond=0)
-                .isoformat()
-            )
+        parsed_relative = parse_relative_datetime_hint(lower)
+        if parsed_relative:
+            return parsed_relative
 
         parsed = parse_explicit_date(lower)
         if parsed:
             return parsed[0]
 
-    # Fallback to user text for relative time terms when model omits datetime.
-    user_lower = (user_input or "").lower()
-    if "today" in user_lower or "now" in user_lower:
-        return (
-            datetime.now()
-            .replace(hour=0, minute=0, second=0, microsecond=0)
-            .isoformat()
-        )
-    if "yesterday" in user_lower:
-        return (
-            (datetime.now() - timedelta(days=1))
-            .replace(hour=0, minute=0, second=0, microsecond=0)
-            .isoformat()
-        )
-    parsed_user_date = parse_explicit_date(user_lower)
-    if parsed_user_date:
-        return parsed_user_date[0]
     return None
 
 
@@ -498,8 +627,17 @@ def normalize_model_output(raw: dict, user_input: str) -> dict:
         else:
             item[field] = str(value).strip()
 
+    # ── FIX: Automatically map original user text to remarks if model left it blank
+    if not item.get("remarks") and user_input and len(user_input.strip()) >= 2:
+        item["remarks"] = user_input.strip().capitalize()
+
     raw_payment_method = item.get("payment_method")
-    if not is_empty(raw_payment_method) and has_explicit_payment_method(user_input):
+    # ALWAYS clear payment_method if user didn't explicitly mention it.
+    # This stops the model's hallucinated "cash" from leaking through.
+    if not has_explicit_payment_method(user_input):
+        item["payment_method"] = None
+    elif not is_empty(raw_payment_method):
+        # User mentioned a payment method — extract it directly from their input
         payment_match = re.search(
             r"\b(cash|upi|gpay|phonepe|paytm|card|credit card|debit card|"
             r"bank transfer|net ?banking|netbanking|neft|imps|wallet|online|cheque|emi)\b",
@@ -509,8 +647,6 @@ def normalize_model_output(raw: dict, user_input: str) -> dict:
             item["payment_method"] = normalize_payment_method(payment_match.group(0))
         else:
             item["payment_method"] = normalize_payment_method(str(raw_payment_method))
-    elif not is_empty(raw_payment_method):
-        item["payment_method"] = normalize_payment_method(str(raw_payment_method))
     else:
         item["payment_method"] = None
 
@@ -518,6 +654,40 @@ def normalize_model_output(raw: dict, user_input: str) -> dict:
     if data.get("intent") == "query":
         inferred = infer_transaction_intent(user_input)
         data["intent"] = inferred if inferred else "expense"
+
+    if data.get("intent") == "income":
+        item = data["items"][0]
+        if is_empty(item.get("source")):
+            # ── FIX: Automatically 'assume' or identify source for income (no follow-up asked)
+            text = user_input.lower()
+            if any(w in text for w in ["salary", "paycheck", "wages"]):
+                item["source"] = "Salary"
+            elif any(w in text for w in ["freelance", "project", "gig"]):
+                item["source"] = "Freelance"
+            elif any(w in text for w in ["bonus", "incentive"]):
+                item["source"] = "Bonus"
+            elif any(w in text for w in ["gift", "present"]):
+                item["source"] = "Gift"
+            elif any(w in text for w in ["someone", "friend", "returned"]):
+                item["source"] = "Other Income"
+            elif any(w in text for w in ["dividend"]):
+                item["source"] = "Dividend"
+            elif any(w in text for w in ["interest"]):
+                item["source"] = "Interest"
+            elif any(w in text for w in ["investment", "stock", "return", "gain"]):
+                item["source"] = "Investment"
+            elif any(w in text for w in ["business", "profit", "sales"]):
+                item["source"] = "Business"
+            elif any(w in text for w in ["refund", "cashback", "cash back"]):
+                item["source"] = "Refund/Cashback"
+            elif "rent" in text:
+                item["source"] = "Rent"
+            elif "scholarship" in text:
+                item["source"] = "Scholarship"
+            elif not is_empty(item.get("category")):
+                item["source"] = item["category"]
+            else:
+                item["source"] = "Income"
 
     data["items"] = [item]
     return apply_transaction_hints(user_input, data)
@@ -683,6 +853,9 @@ def infer_transaction_intent(text: str) -> Optional[str]:
         "credited",
         "salary credited",
         "amount credited",
+        "freelance",
+        "payment received",
+        "got payment",
     ]
     expense_starters = [
         "spent",
@@ -713,7 +886,7 @@ def infer_transaction_intent(text: str) -> Optional[str]:
 
     normalized = (text or "").lower()
     if has_amount(normalized):
-        income_markers = ["salary", "received", "credited", "income", "bonus", "refund"]
+        income_markers = ["salary", "received", "credited", "income", "bonus", "refund", "freelance", "payment"]
         expense_markers = [
             "petrol",
             "fuel",
@@ -766,6 +939,26 @@ def infer_expense_category(text: str, item_name: Optional[str] = None) -> Option
 
     explicit = extract_category(merged)
     return explicit if explicit else None
+
+
+def infer_income_payer(text: str) -> Optional[str]:
+    """Infer payer name from patterns like 'X paid me' or 'X sent me'."""
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return None
+
+    # Pattern: [Name] paid me / [Name] sent me
+    match_payer = re.search(
+        r"^([a-zA-Z0-9][a-zA-Z0-9&'.\- ]{1,30}?)\s+(?:paid|sent)\s+me\b",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match_payer:
+        payer = match_payer.group(1).strip(" .,-")
+        if payer and payer.lower() not in {"someone", "friend", "i", "he", "she"}:
+            return payer.title()
+
+    return infer_explicit_merchant(text)
 
 
 def infer_explicit_merchant(text: str) -> Optional[str]:
@@ -1147,6 +1340,12 @@ def apply_transaction_hints(user_input: str, data: dict) -> dict:
                 or str(item.get("item")).strip().lower() in FILLER_VALUES
             ):
                 item["item"] = inferred_source
+        
+        # ── FIX: Better Payer Extraction for Income
+        inferred_payer = infer_income_payer(user_input)
+        if inferred_payer and is_empty(item.get("payer")):
+            item["payer"] = inferred_payer
+
     elif data.get("intent") == "expense":
         # Use the intelligent item resolver: prioritize user-text inference, then model output
         best_item = resolve_best_item(user_input, item.get("item"))
@@ -1169,6 +1368,101 @@ def apply_transaction_hints(user_input: str, data: dict) -> dict:
             inferred_merchant = infer_explicit_merchant(user_input)
             if inferred_merchant:
                 item["merchant"] = inferred_merchant
+
+    # FIX 5: Override model category if user explicitly mentioned a known category word
+    # Fixes: 'spend on groceries' → model says Food → override to Groceries
+    if data.get("intent") == "expense":
+        user_lower_cat = (user_input or "").lower()
+        for known_cat in KNOWN_CATEGORIES:
+            if re.search(rf"\b{re.escape(known_cat)}\b", user_lower_cat):
+                item["category"] = known_cat.title()
+                break
+
+    # FIX 6: Item keyword → category fallback when model returns null/Other
+    # Fixes: 'bought subscription 799' → category=None → RAG gets no category signal
+    ITEM_TO_CATEGORY = {
+        # Entertainment
+        "subscription": "Entertainment",
+        "netflix": "Entertainment",
+        "spotify": "Entertainment",
+        "hotstar": "Entertainment",
+        "prime": "Entertainment",
+        "disney": "Entertainment",
+        "youtube premium": "Entertainment",
+        "movie ticket": "Entertainment",
+        "movie tickets": "Entertainment",
+        "cinema": "Entertainment",
+        "pvr": "Entertainment",
+        "inox": "Entertainment",
+        "gaming": "Entertainment",
+        "game": "Entertainment",
+        # Transport
+        "petrol": "Transport",
+        "diesel": "Transport",
+        "fuel": "Transport",
+        "cab": "Transport",
+        "uber": "Transport",
+        "ola": "Transport",
+        "rapido": "Transport",
+        "auto": "Transport",
+        "metro": "Transport",
+        "bus fare": "Transport",
+        "bus pass": "Transport",
+        "train ticket": "Transport",
+        "flight ticket": "Transport",
+        "flight": "Transport",
+        "parking": "Transport",
+        "toll": "Transport",
+        "car service": "Transport",
+        "bike repair": "Transport",
+        "car wash": "Transport",
+        # Health
+        "medicine": "Health",
+        "medicines": "Health",
+        "tablet": "Health",
+        "tablets": "Health",
+        "doctor": "Health",
+        "hospital": "Health",
+        "pharmacy": "Health",
+        "gym": "Health",
+        "supplement": "Health",
+        "supplements": "Health",
+        "protein": "Health",
+        "vitamin": "Health",
+        "vitamins": "Health",
+        "lab test": "Health",
+        "checkup": "Health",
+        "dental": "Health",
+        "physiotherapy": "Health",
+        # Groceries
+        "groceries": "Groceries",
+        "grocery": "Groceries",
+        "vegetables": "Groceries",
+        "fruits": "Groceries",
+        "sabzi": "Groceries",
+        "doodh": "Groceries",
+        # Bills
+        "electricity": "Bills",
+        "electric bill": "Bills",
+        "water bill": "Bills",
+        "recharge": "Bills",
+        "wifi": "Bills",
+        "internet bill": "Bills",
+        "mobile bill": "Bills",
+        "gas bill": "Bills",
+    }
+    if is_empty(item.get("category")) or str(item.get("category", "")).lower() in {
+        "other",
+        "none",
+        "null",
+    }:
+        user_lower_item = (user_input or "").lower()
+        item_val = str(item.get("item") or "").lower()
+        combined = user_lower_item + " " + item_val
+        for keyword, category in ITEM_TO_CATEGORY.items():
+            if keyword in combined:
+                item["category"] = category
+                break
 
     # Never auto-generate remarks: keep only user-explicit remark intent.
     raw_remarks = item.get("remarks")
@@ -1276,10 +1570,12 @@ def parse_relative_datetime_point(text: str) -> Optional[str]:
         ).isoformat()
 
     ago_match = re.search(
-        r"\b(\d+)\s+(day|week|month|year)s?\s+(ago|back)\b", normalized
+        r"\b(\d+|a|one|two|three|four|five|six|seven|eight|nine|ten)\s+(day|week|month|year)s?\s+(ago|back)\b", normalized
     )
     if ago_match:
-        value = int(ago_match.group(1))
+        val_str = ago_match.group(1)
+        word_to_num = {"a": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+        value = int(val_str) if val_str.isdigit() else word_to_num[val_str]
         unit = ago_match.group(2)
         if unit == "day":
             target = now - timedelta(days=value)
@@ -1461,21 +1757,26 @@ def extract_fields(user_input: str, context: list = []) -> dict:
     is_query = is_query_like_message(user_input)
     if is_query:
         return parse_query_heuristically(user_input)
-    prompt = build_extraction_prompt(user_input, context)
+    raw_prompt = build_extraction_prompt(user_input, context)
+    chat_prompt = CHATML_TEMPLATE.format(user=raw_prompt.strip())
 
     try:
         t1 = time.time()
-        response = ollama.chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            format="json",
-            options=OLLAMA_FAST_OPTIONS,
+        if llm is None:
+             raise RuntimeError("Local LLM not initialized")
+             
+        response = llm(
+            chat_prompt,
+            max_tokens=256,
+            temperature=0.0,
+            stop=["<|im_end|>"],
+            echo=False,
         )
         t2 = time.time()
-        print(f"Ollama response time: {t2 - t1:.2f} seconds")
-        raw = response["message"]["content"].strip()
+        print(f"Local LLM response time: {t2 - t1:.2f} seconds")
+        raw = response["choices"][0]["text"].strip()
     except Exception as e:
-        print(f"Ollama failed: {e}")
+        print(f"Local LLM failed: {e}")
         return normalize_model_output(
             {"intent": infer_transaction_intent(user_input), "items": [empty_item()]},
             user_input,
@@ -1636,7 +1937,12 @@ def merge_followup_answer(existing: dict, answer: str, field: str) -> dict:
         elif "income" in ans:
             existing["intent"] = "income"
         else:
-            existing["intent"] = "unsupported"
+            # ── FIX: Allow the follow-up to understand sentences like "got freelance payment"
+            inferred = infer_transaction_intent(ans)
+            if inferred:
+                existing["intent"] = inferred
+            else:
+                existing["intent"] = "unsupported"
         return existing
 
     if not existing.get("items"):
@@ -2011,8 +2317,8 @@ def build_embed_text(entry: dict) -> str:
     item = entry.get("items", [{}])[0] if entry.get("items") else {}
     intent = str(entry.get("intent") or "").strip().lower() or "expense"
 
-    # Plain natural language — no colons, no amount, no currency
-    # Order: intent → category → item → merchant/payer → payment
+    # Plain natural language — no colons, no amount, no prepositions
+    # all-MiniLM-L6-v2 scores plain words higher than "category:Health"
     parts = [intent]
 
     category = item.get("category")
@@ -2186,7 +2492,9 @@ def retrieve_assumptions(
                     stage1_distances[idx] if idx < len(stage1_distances) else None
                 )
                 raw_similarity = to_similarity(distance)
-                cleaned = _annotate_rag_entry(meta, raw_similarity, raw_similarity, True)
+                cleaned = _annotate_rag_entry(
+                    meta, raw_similarity, raw_similarity, True
+                )
                 if str(cleaned.get("intent") or "").strip().lower() != intent:
                     continue
                 candidate_anchor = str(cleaned.get(anchor_field) or "").strip().lower()
@@ -2236,7 +2544,7 @@ def retrieve_assumptions(
 
             if cleaned_stage1:
                 if intent == "income":
-                    stage1_fields = ["payment_method", "payer"]
+                    stage1_fields = ["source", "payment_method", "payer"]
                 else:
                     stage1_fields = ["merchant", "payment_method"]
                 assumptions = _majority_vote(cleaned_stage1, stage1_fields)
@@ -2257,6 +2565,10 @@ def retrieve_assumptions(
                 parts.append(str(item.get("source")).strip())
             if _is_real_value(item.get("payer")):
                 parts.append(str(item.get("payer")).strip())
+            # Add original query for income so "got salary" finds
+            # "received salary" even when source/payer are empty
+            if query_text:
+                parts.append(query_text)
         else:
             if _is_real_value(item.get("merchant")):
                 parts.append(str(item.get("merchant")).strip())
@@ -2362,7 +2674,7 @@ def retrieve_assumptions(
         )
 
         if intent == "income":
-            stage2_fields = ["payment_method", "payer"]
+            stage2_fields = ["source", "payment_method", "payer"]
         else:
             stage2_fields = ["merchant", "payment_method"]
         assumptions = _majority_vote(filtered, stage2_fields)
@@ -2469,6 +2781,12 @@ def detect_explicit_fields(user_input: str, data: dict) -> set[str]:
         if len(item_val) >= 3 and item_val in text:
             explicit.add("item")
 
+    # Payer — if identified, check if it was literally in input
+    if _value_is_present(item.get("payer")):
+        payer_val = str(item.get("payer")).strip().lower()
+        if len(payer_val) >= 3 and payer_val in text:
+            explicit.add("payer")
+
     if (
         _value_is_present(item.get("currency"))
         and str(item.get("currency")).lower() in text
@@ -2551,10 +2869,19 @@ def score_entry_for_field(
             or has_current_item_overlap
         )
         if not has_direct_evidence:
-            score = min(score, 0.58)
+            # Cap BELOW the category boost (0.60) so category-only matches
+            # never produce merchant suggestions without item evidence.
+            # Previously 0.58 was overridden by the 0.60 category boost.
+            score = min(score, 0.54)
 
-    # PENALTY: Different category -> hard penalty
-    if entry_category and current_category and entry_category != current_category:
+    # PENALTY: Different category — only penalize when BOTH are known and different
+    # If current_category is empty (model returned null), don't penalize
+    if (
+        entry_category
+        and current_category  # ← both must be non-empty
+        and len(current_category) > 1  # ← not a placeholder
+        and entry_category != current_category
+    ):
         score = min(score, 0.45)
 
     return min(score, 1.0)
@@ -2589,7 +2916,7 @@ def build_assumptions(data: dict, past_entries: list, explicit_fields: set) -> t
     if intent == "expense":
         assumable_fields = ["merchant", "payment_method"]
     else:
-        assumable_fields = ["payment_method", "payer"]
+        assumable_fields = ["source", "payment_method", "payer"]
 
     VAGUE_ITEMS = {
         "something",
@@ -2809,6 +3136,11 @@ def prepare_chat_outcome(extracted: dict, user_input: str, past_entries: list) -
             next_optional = optional_queue[0]
 
             if next_optional == "bill_no":
+                # Bill numbers are unique — never suggest from past entries
+                suggestions = extracted.get("optional_assumption_suggestions", {})
+                if "bill_no" in suggestions:
+                    del suggestions["bill_no"]
+                extracted["optional_assumption_suggestions"] = suggestions
                 return {
                     "status": "followup",
                     "question": "Do you have a bill number? (optional - say 'skip' to continue)",
@@ -3068,7 +3400,9 @@ def save_to_db(entry: dict):
     flat = {
         k: str(v)
         for k, v in raw_fields.items()
-        if v is not None and str(v).strip() != "" and str(v).strip().lower() not in FILLER_VALUES
+        if v is not None
+        and str(v).strip() != ""
+        and str(v).strip().lower() not in FILLER_VALUES
     }
 
     tx_id = str(uuid.uuid4())
@@ -3224,11 +3558,12 @@ async def chat(req: ChatRequest):
                 answer = normalize_payment_method(answer) or answer
             session = merge_followup_answer(session, answer, field)
 
-        past = (
-            session.get("retrieved_context")
-            if isinstance(session.get("retrieved_context"), list)
-            else []
-        )
+        # Always preserve original retrieved_context — never overwrite with empty
+        existing_context = session.get("retrieved_context")
+        if isinstance(existing_context, list) and existing_context:
+            past = existing_context
+        else:
+            past = []
         session["retrieved_context"] = past
         original_query = (
             req.session_data.get("original_query", "")
@@ -3239,6 +3574,36 @@ async def chat(req: ChatRequest):
 
     # Fresh input: extract -> RAG -> check
     extracted = extract_fields(req.message, [])
+
+    # ── Safety net: correct obviously wrong categories before RAG lookup
+    # This prevents Groceries category on medicine/tablet queries from
+    # poisoning the RAG category guard and blocking Health suggestions
+    item_for_correction = extracted.get("items", [{}])[0] if extracted.get("items") else {}
+    current_cat = str(item_for_correction.get("category") or "").strip().lower()
+    query_lower_correction = req.message.lower()
+
+    STRONG_CATEGORY_OVERRIDES = {
+        "health": ["tablet", "tablets", "medicine", "medicines", "supplement",
+                    "supplements", "vitamin", "vitamins", "gym", "doctor",
+                    "hospital", "pharmacy", "clinic", "pills", "capsule"],
+        "transport": ["petrol", "diesel", "fuel", "cab", "uber", "ola",
+                      "rapido", "metro", "bus", "train", "flight", "toll",
+                      "parking", "auto rickshaw"],
+        "entertainment": ["netflix", "spotify", "hotstar", "prime", "movie",
+                          "cinema", "pvr", "inox", "subscription", "gaming"],
+        "bills": ["electricity", "wifi", "internet", "mobile recharge",
+                  "water bill", "gas bill", "broadband", "recharge"],
+        "shopping": ["sneakers", "shoes", "shirt", "tshirt", "jeans",
+                     "dress", "jacket", "watch", "bag", "kurta"],
+    }
+
+    for correct_cat, keywords in STRONG_CATEGORY_OVERRIDES.items():
+        if any(kw in query_lower_correction for kw in keywords):
+            if current_cat != correct_cat:
+                item_for_correction["category"] = correct_cat.title()
+                extracted["items"] = [item_for_correction]
+            break
+
     rag_result = retrieve_assumptions(extracted)
     past = rag_result.get("matched_entries", []) if isinstance(rag_result, dict) else []
     rag_assumptions = (
@@ -3285,7 +3650,9 @@ async def analytics(req: AnalyticsRequest):
             where_clause = {"$and": where_conditions}
 
         if where_clause:
-            data = collection.get(where=where_clause, include=["metadatas"]).get("metadatas", [])
+            data = collection.get(where=where_clause, include=["metadatas"]).get(
+                "metadatas", []
+            )
         else:
             data = collection.get(include=["metadatas"]).get("metadatas", [])
     except Exception:

@@ -9,7 +9,7 @@ __pycache__/
 *.tar
 
 # DB
-*.sqlite3
+*.sqlite3*.gguf
 
 # Vector DB
 backend/finance_memory/
