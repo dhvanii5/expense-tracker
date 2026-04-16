@@ -83,7 +83,6 @@ export default function Index() {
           content: response.question || 'Need one more detail to continue.',
           timestamp: new Date(),
           transaction: nextDraft || undefined,
-          followUp: response.followup_field ? `Please share ${response.followup_field}.` : undefined,
         });
       } else {
         setPendingDraft(nextDraft);
