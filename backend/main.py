@@ -12,6 +12,8 @@ import math
 import time
 import os
 import warnings
+import traceback
+from pathlib import Path
 import chromadb
 
 _SentenceTransformer = None
@@ -27,19 +29,25 @@ EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 embed_model = None
 chroma_client = None
 collection = None
+collection_path = None
 llm = None
 _embed_model_load_attempted = False
+MODEL_DIR = Path(__file__).resolve().parent.parent / "model"
 
 
 def ensure_collection():
-    global chroma_client, collection
-    if collection is not None:
+    global chroma_client, collection, collection_path
+    base_dir = Path(__file__).resolve().parent
+    target_path = str(base_dir / "finance_memory")
+
+    if collection is not None and collection_path == target_path:
         return collection
 
-    chroma_client = chromadb.PersistentClient(path="./finance_memory")
+    chroma_client = chromadb.PersistentClient(path=target_path)
     collection = chroma_client.get_or_create_collection(
         "transactions", metadata={"hf:space": "cosine"}
     )
+    collection_path = target_path
     return collection
 
 
@@ -87,8 +95,20 @@ async def lifespan(app: FastAPI):
         "ignore",
         message=r"You are sending unauthenticated requests to the HF Hub.*",
     )
-    # Heavy dependencies are initialized lazily so the API can bind immediately.
-    llm = None
+    # Load the local GGUF model if available; fall back to heuristics otherwise.
+    if Llama is not None:
+        try:
+            llm = Llama(
+                model_path=str(MODEL_PATH),
+                n_ctx=1024,
+                verbose=False,
+            )
+            print(f"Loaded local LLM: {MODEL_PATH}")
+        except Exception as e:
+            llm = None
+            print(f"⚠️ Failed to load local LLM: {e}")
+    else:
+        llm = None
     yield
 
 
@@ -101,9 +121,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = "d:/expense tracker/model/expense_1.5b.Q4_K_M.gguf"
-MODEL_NAME = os.path.basename(MODEL_PATH)
+MODEL_PATH = MODEL_DIR / "qwen3b-dhvani-q8_0.gguf"
+MODEL_NAME = MODEL_PATH.name
 CHATML_TEMPLATE = "<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+
+# Ephemeral last follow-up storage for clients that omit session_data.
+# This is a best-effort fallback for single-user/dev scenarios.
+last_followup_session = None
+last_followup_time = None
+last_followup_field = None
 
 # Canonical schema consumed by business logic regardless of model output quirks.
 CANONICAL_SCHEMA = {
@@ -2034,6 +2060,25 @@ def is_query_like_message(user_input: str, is_followup: bool = False) -> bool:
     return False
 
 
+def should_start_fresh_transaction(user_input: str) -> bool:
+    """
+    Detect whether a message is a new transaction statement even if a follow-up
+    session is still active.
+
+    This prevents a new sentence like "spend 300 on groceries today" from being
+    merged into the prior merchant/payment follow-up.
+    """
+    text = (user_input or "").strip()
+    if not text:
+        return False
+
+    if looks_like_transaction_statement(text):
+        return True
+
+    intent = infer_transaction_intent(text)
+    return bool(intent and has_amount(text))
+
+
 def parse_query_heuristically(user_input: str) -> dict:
     text = user_input.lower()
     category = extract_category(text)
@@ -2113,10 +2158,39 @@ Input: "{user_input}"
 JSON:"""
 
 
+def should_use_fast_extraction(user_input: str) -> bool:
+    text = (user_input or "").strip()
+    if not text:
+        return False
+    if is_query_like_message(text):
+        return False
+
+    strong_signals = [
+        has_amount(text),
+        bool(infer_transaction_intent(text)),
+        looks_like_transaction_statement(text),
+        bool(infer_explicit_merchant(text)),
+        bool(infer_expense_item(text)),
+        bool(infer_income_source(text)),
+        bool(infer_income_payer(text)),
+    ]
+    return any(strong_signals)
+
+
 def extract_fields(user_input: str, context: list = []) -> dict:
     is_query = is_query_like_message(user_input)
     if is_query:
         return parse_query_heuristically(user_input)
+
+    # Fast path: simple transaction statements already have enough signal for
+    # heuristic extraction, so avoid a full GGUF round-trip when possible.
+    if should_use_fast_extraction(user_input):
+        heuristic = {
+            "intent": infer_transaction_intent(user_input),
+            "items": [empty_item()],
+        }
+        return normalize_model_output(heuristic, user_input)
+
     raw_prompt = build_extraction_prompt(user_input, context)
     chat_prompt = CHATML_TEMPLATE.format(user=raw_prompt.strip())
 
@@ -2127,7 +2201,7 @@ def extract_fields(user_input: str, context: list = []) -> dict:
 
         response = llm(
             chat_prompt,
-            max_tokens=256,
+            max_tokens=128,
             temperature=0.0,
             stop=["<|im_end|>"],
             echo=False,
@@ -2221,13 +2295,6 @@ def build_optional_assumption_suggestions(
         return {}
 
     explicit_fields = detect_explicit_fields(user_input, extracted)
-    rag_result = retrieve_assumptions(extracted)
-    rag_assumptions = (
-        rag_result.get("assumptions", {}) if isinstance(rag_result, dict) else {}
-    )
-    matched_entries = (
-        rag_result.get("matched_entries", []) if isinstance(rag_result, dict) else []
-    )
     item_text = str(item.get("item") or "")
     category_text = str(item.get("category") or "")
     intent = str(extracted.get("intent") or "").strip().lower()
@@ -2237,7 +2304,13 @@ def build_optional_assumption_suggestions(
         else {"payment_method", "payer"}
     )
 
+    # Use already-computed RAG results from /chat — don't call retrieve_assumptions again
+    rag_assumptions = extracted.get("rag_assumptions") or {}
+    matched_entries = extracted.get("retrieved_context") or []
+
     suggestions = {}
+
+    # Primary: use rag_assumptions directly (already computed with correct query)
     for field in optional_queue:
         if field not in allowed_fields:
             continue
@@ -2246,16 +2319,11 @@ def build_optional_assumption_suggestions(
         if not is_empty(item.get(field)):
             continue
         value = rag_assumptions.get(field)
-        confidence = rag_assumptions.get(f"{field}_confidence", 0.0)
         if is_empty(value):
-            continue
-        if confidence and float(confidence) < 0.35:
             continue
         suggestions[field] = str(value).strip()
 
-    # Fallback for fields often learned from habit (merchant/payment_method):
-    # if majority-vote assumptions did not emit a field, score the best semantic
-    # match using the query item plus category so item-specific merchants win.
+    # Fallback: score matched_entries directly
     for field in optional_queue:
         if field not in allowed_fields:
             continue
@@ -2267,14 +2335,15 @@ def build_optional_assumption_suggestions(
             continue
 
         best_value, best_score = _pick_optional_candidate(
-            matched_entries[:5],
+            matched_entries[:10],
             field,
             user_input,
             item_text,
             category_text,
         )
 
-        if best_value and best_score >= 0.45:
+        threshold = 0.44 if field == "merchant" else 0.45
+        if best_value and best_score >= threshold:
             suggestions[field] = best_value
 
     return suggestions
@@ -2608,18 +2677,16 @@ def _score_optional_candidate(
         context_overlap = _jaccard_similarity(focus_tokens, entry_context_tokens)
 
         score += 0.85 * item_overlap
-        score += 0.20 * category_overlap
         score += 0.15 * context_overlap
         score += 0.20 * _jaccard_similarity(query_tokens, candidate_tokens)
         if query_tokens & candidate_tokens:
             score += 0.08
+        if item_overlap >= 0.5:
+            score += 0.18
 
-        # Guardrail: when user gave a concrete item (dinner/coffee/rice/cab),
-        # require some item-level overlap before suggesting a merchant.
+        # ── GUARDRAIL: apply cap FIRST before any category boost
         if item_tokens and item_overlap < 0.20:
             score = min(score, 0.46)
-
-        # Category-only matches should not dominate merchant predictions.
         if (
             category_tokens
             and category_overlap > 0
@@ -2628,8 +2695,17 @@ def _score_optional_candidate(
         ):
             score = min(score, 0.48)
 
+        # ── CATEGORY BOOST: added AFTER cap so it isn't wiped out
+        # When same category (e.g. both "health"), this is strong signal
+        entry_cat_tokens = _tokenize_match_text(str(entry.get("category") or ""))
+        current_cat_tokens = _tokenize_match_text(category_text)
+        category_match = _jaccard_similarity(current_cat_tokens, entry_cat_tokens)
+        if category_match >= 0.8:
+            score += 0.20
+
         return score
 
+    # payment_method, category, source, payer — unchanged
     if field == "payment_method":
         candidate_tokens = _tokenize_match_text(str(entry.get("payment_method") or ""))
         score = base
@@ -2764,7 +2840,7 @@ def retrieve_assumptions(
     try:
         active_collection = target_collection or ensure_collection()
         model = ensure_embed_model()
-        if active_collection is None or model is None:
+        if active_collection is None:
             return {
                 "assumptions": {},
                 "retrieval_stage": "semantic_fallback",
@@ -2789,6 +2865,9 @@ def retrieve_assumptions(
             }
 
         query_text = str(extracted.get("original_query") or "")
+        print(
+            f"DEBUG retrieve_assumptions: query_text='{query_text}' | intent='{intent}' | item='{item.get('item')}' | category='{item.get('category')}' | merchant='{item.get('merchant')}' | collection_count={count}"
+        )
 
         def _norm_category(value: Optional[str]) -> str:
             normalized = normalize_expense_category_value(
@@ -2823,6 +2902,114 @@ def retrieve_assumptions(
                 inferred_query_category = str(inferred or "").strip().lower()
                 if _is_non_informative_category(inferred_query_category):
                     inferred_query_category = ""
+
+            if not inferred_query_category:
+                for cat, kws in CATEGORY_KEYWORDS.items():
+                    if any(k in query_text.lower() for k in kws):
+                        inferred_query_category = cat.lower()
+                        break
+
+        if model is None:
+            lexical_rows = []
+            try:
+                all_rows = active_collection.get(include=["metadatas"])
+                all_metas = (
+                    all_rows.get("metadatas", []) if isinstance(all_rows, dict) else []
+                )
+                item_text = str(item.get("item") or "")
+                category_value = inferred_query_category or str(
+                    item.get("category") or ""
+                )
+                for meta in all_metas:
+                    if not isinstance(meta, dict):
+                        continue
+                    cleaned = _annotate_rag_entry(meta, 0.0, 0.0, False)
+                    if str(cleaned.get("intent") or "").strip().lower() != intent:
+                        continue
+                    if intent == "expense" and inferred_query_category:
+                        entry_category = _norm_category(cleaned.get("category"))
+                        if entry_category and entry_category != inferred_query_category:
+                            continue
+
+                    lexical_score = _score_optional_candidate(
+                        cleaned,
+                        "merchant" if intent == "expense" else "payment_method",
+                        query_text,
+                        item_text,
+                        category_value,
+                    )
+                    if intent == "expense":
+                        lexical_score = max(
+                            lexical_score,
+                            _score_optional_candidate(
+                                cleaned,
+                                "payment_method",
+                                query_text,
+                                item_text,
+                                category_value,
+                            ),
+                        )
+
+                    if lexical_score >= 0.35:
+                        lexical_rows.append(
+                            _annotate_rag_entry(
+                                meta, lexical_score, lexical_score, True
+                            )
+                        )
+
+                lexical_rows.sort(
+                    key=lambda entry: (
+                        float(entry.get("_similarity", 0.0)),
+                        parse_stored_datetime(entry.get("datetime")),
+                    ),
+                    reverse=True,
+                )
+            except Exception:
+                lexical_rows = []
+
+            if lexical_rows:
+                if intent == "income":
+                    assumptions = _majority_vote(
+                        lexical_rows, ["source", "payment_method", "payer"]
+                    )
+                else:
+                    assumptions = {}
+                    item_text = str(item.get("item") or "")
+                    category_text = inferred_query_category or str(
+                        item.get("category") or ""
+                    )
+
+                    merchant_value, merchant_score = _pick_optional_candidate(
+                        lexical_rows,
+                        "merchant",
+                        query_text,
+                        item_text,
+                        category_text,
+                    )
+                    if merchant_value and merchant_score >= 0.35:
+                        assumptions["merchant"] = merchant_value
+                        assumptions["merchant_confidence"] = round(
+                            min(1.0, merchant_score), 3
+                        )
+
+                    payment_value, payment_score = _pick_optional_candidate(
+                        lexical_rows,
+                        "payment_method",
+                        query_text,
+                        item_text,
+                        category_text,
+                    )
+                    if payment_value and payment_score >= 0.35:
+                        assumptions["payment_method"] = payment_value
+                        assumptions["payment_method_confidence"] = round(
+                            min(1.0, payment_score), 3
+                        )
+
+                return {
+                    "assumptions": assumptions,
+                    "retrieval_stage": "lexical_fallback",
+                    "matched_entries": lexical_rows[:5],
+                }
 
         merchant = (
             item.get("merchant") if _is_real_value(item.get("merchant")) else None
@@ -3054,6 +3241,66 @@ def retrieve_assumptions(
                     break
             filtered = relaxed
 
+        if not filtered:
+            try:
+                lexical_rows = []
+                all_rows = active_collection.get(include=["metadatas"])
+                all_metas = (
+                    all_rows.get("metadatas", []) if isinstance(all_rows, dict) else []
+                )
+                for meta in all_metas:
+                    if not isinstance(meta, dict):
+                        continue
+                    cleaned = _annotate_rag_entry(meta, 0.0, 0.0, False)
+                    if str(cleaned.get("intent") or "").strip().lower() != intent:
+                        continue
+
+                    if intent == "expense" and inferred_query_category:
+                        entry_category = _norm_category(cleaned.get("category"))
+                        if entry_category and entry_category != inferred_query_category:
+                            continue
+
+                    item_text = str(item.get("item") or "")
+                    category_value = inferred_query_category or str(
+                        item.get("category") or ""
+                    )
+                    lexical_score = _score_optional_candidate(
+                        cleaned,
+                        "merchant" if intent == "expense" else "payment_method",
+                        query_text,
+                        item_text,
+                        category_value,
+                    )
+                    if intent == "expense":
+                        lexical_score = max(
+                            lexical_score,
+                            _score_optional_candidate(
+                                cleaned,
+                                "payment_method",
+                                query_text,
+                                item_text,
+                                category_value,
+                            ),
+                        )
+
+                    if lexical_score >= 0.35:
+                        lexical_rows.append(
+                            _annotate_rag_entry(
+                                meta, lexical_score, lexical_score, True
+                            )
+                        )
+
+                lexical_rows.sort(
+                    key=lambda entry: (
+                        float(entry.get("_similarity", 0.0)),
+                        parse_stored_datetime(entry.get("datetime")),
+                    ),
+                    reverse=True,
+                )
+                filtered = lexical_rows[:5]
+            except Exception:
+                pass
+
         # Recency boost for assumption voting: among similarity-qualified rows,
         # prefer recent transactions by sorting datetime descending.
         filtered.sort(
@@ -3077,7 +3324,35 @@ def retrieve_assumptions(
                 item_text,
                 category_text,
             )
-            if merchant_value and merchant_score >= 0.52:
+
+            # Dynamic threshold: if the user's item text strongly matches a past
+            # entry's item (e.g. "Medicine" -> "Medicine"), trust the merchant even
+            # at a lower overall score. Without this, the merchant name never appears
+            # in the query so jaccard(query, merchant_tokens)=0 and score stalls below 0.52.
+            merchant_threshold = 0.52
+            if item_text and filtered:
+                best_item_overlap = max(
+                    _jaccard_similarity(
+                        _tokenize_match_text(item_text),
+                        _tokenize_match_text(str(e.get("item") or "")),
+                    )
+                    for e in filtered[:5]
+                )
+                if best_item_overlap >= 0.5:
+                    merchant_threshold = 0.42
+
+            if inferred_query_category and filtered:
+                best_cat_match = any(
+                    _norm_category(e.get("category")) == inferred_query_category
+                    for e in filtered[:5]
+                )
+                if best_cat_match and merchant_threshold > 0.44:
+                    merchant_threshold = 0.44
+
+            print(
+                f"DEBUG retrieve_assumptions stage2: merchant_value='{merchant_value}' | merchant_score={merchant_score:.3f} | threshold={merchant_threshold} | passes={merchant_value and merchant_score >= merchant_threshold}"
+            )
+            if merchant_value and merchant_score >= merchant_threshold:
                 assumptions["merchant"] = merchant_value
                 assumptions["merchant_confidence"] = round(min(1.0, merchant_score), 3)
 
@@ -3094,12 +3369,66 @@ def retrieve_assumptions(
                     min(1.0, payment_score), 3
                 )
 
+            # If semantic filtering kept the right intent/category neighbors but
+            # still missed the merchant, do one broader lexical rescue across all
+            # intent-matched rows. This keeps merchant suggestions available when
+            # the vector slice is weak but the historical item/merchant pattern is
+            # still clearly present in the DB.
+            if intent == "expense" and "merchant" not in assumptions:
+                try:
+                    rescue_rows = []
+                    all_rows = active_collection.get(include=["metadatas"])
+                    all_metas = (
+                        all_rows.get("metadatas", [])
+                        if isinstance(all_rows, dict)
+                        else []
+                    )
+                    for meta in all_metas:
+                        if not isinstance(meta, dict):
+                            continue
+                        cleaned = _annotate_rag_entry(meta, 0.0, 0.0, False)
+                        if str(cleaned.get("intent") or "").strip().lower() != intent:
+                            continue
+                        if inferred_query_category:
+                            entry_category = _norm_category(cleaned.get("category"))
+                            if (
+                                entry_category
+                                and entry_category != inferred_query_category
+                            ):
+                                continue
+                        rescue_rows.append(cleaned)
+
+                    merchant_value, merchant_score = _pick_optional_candidate(
+                        rescue_rows,
+                        "merchant",
+                        query_text,
+                        item_text,
+                        category_text,
+                    )
+                    if merchant_value and merchant_score >= 0.35:
+                        assumptions["merchant"] = merchant_value
+                        assumptions["merchant_confidence"] = round(
+                            min(1.0, merchant_score), 3
+                        )
+                except Exception:
+                    pass
+
+            print(
+                f"DEBUG retrieve_assumptions: filtered_count={len(filtered)} | assumptions={assumptions}"
+            )
+            for i, entry in enumerate(filtered[:3]):
+                print(
+                    f"  filtered[{i}]: item='{entry.get('item')}' cat='{entry.get('category')}' merchant='{entry.get('merchant')}' sim={entry.get('_similarity')}"
+                )
+
         return {
             "assumptions": assumptions,
             "retrieval_stage": "semantic_fallback",
             "matched_entries": filtered,
         }
+
     except Exception:
+        traceback.print_exc()
         return {
             "assumptions": {},
             "retrieval_stage": "semantic_fallback",
@@ -3386,7 +3715,7 @@ def build_assumptions(data: dict, past_entries: list, explicit_fields: set) -> t
 
             # Strong category guard for expense assumptions to prevent cross-category leak.
             if intent == "expense" and current_category and entry_category:
-                if entry_category != current_category and field in {
+                if entry_category.lower() != current_category.lower() and field in {
                     "merchant",
                     "payment_method",
                 }:
@@ -3658,6 +3987,13 @@ def prepare_chat_outcome(extracted: dict, user_input: str, past_entries: list) -
                 suggestions = {}
 
             if not suggestions:
+                suggestions.update(
+                    build_optional_assumption_suggestions(
+                        extracted, optional_queue, user_input
+                    )
+                )
+
+            if not suggestions:
                 explicit_fields = detect_explicit_fields(user_input, extracted)
                 assumptions, candidates, _ = build_assumptions(
                     extracted,
@@ -3682,12 +4018,37 @@ def prepare_chat_outcome(extracted: dict, user_input: str, past_entries: list) -
                 if isinstance(candidates, dict) and candidates:
                     extracted["optional_assumption_candidates"] = candidates
 
+            if next_optional not in suggestions:
+                explicit_fields = detect_explicit_fields(user_input, extracted)
+                assumptions, candidates, _ = build_assumptions(
+                    extracted,
+                    past_entries if isinstance(past_entries, list) else [],
+                    explicit_fields,
+                )
+
+                if next_optional not in explicit_fields and is_empty(
+                    item_data.get(next_optional)
+                ):
+                    value = assumptions.get(next_optional)
+                    if not is_empty(value):
+                        cleaned = clean_assumed_prefix({next_optional: value}).get(
+                            next_optional, ""
+                        )
+                        if cleaned and cleaned.lower() not in FILLER_VALUES:
+                            suggestions[next_optional] = cleaned
+                            if isinstance(candidates, dict) and candidates:
+                                extracted["optional_assumption_candidates"] = candidates
+
             # If scorer-based assumptions don't produce a value for this field,
             # fallback to best semantic candidate from existing matched context.
             if next_optional not in suggestions:
 
                 def get_raw_top(field: str) -> Optional[str]:
                     ranked_pool = candidate_pool
+                    if field == "merchant" and not ranked_pool:
+                        ranked_pool = context_entries
+                    elif field == "merchant" and len(ranked_pool) < 3:
+                        ranked_pool = context_entries or ranked_pool
                     if not ranked_pool:
                         return None
 
@@ -3699,7 +4060,8 @@ def prepare_chat_outcome(extracted: dict, user_input: str, past_entries: list) -
                         category_text,
                     )
 
-                    if best_value and best_score >= 0.45:
+                    merchant_threshold = 0.35 if field == "merchant" else 0.45
+                    if best_value and best_score >= merchant_threshold:
                         cleaned = clean_assumed_prefix({field: best_value}).get(
                             field, ""
                         )
@@ -3784,6 +4146,26 @@ def prepare_chat_outcome(extracted: dict, user_input: str, past_entries: list) -
     }
 
 
+def _prepare_and_record(extracted: dict, user_input: str, past_entries: list) -> dict:
+    """Wrapper that records the last follow-up for the ephemeral fallback."""
+    global last_followup_session, last_followup_time, last_followup_field
+    outcome = prepare_chat_outcome(extracted, user_input, past_entries)
+    try:
+        if isinstance(outcome, dict) and outcome.get("status") == "followup":
+            last_followup_session = outcome.get("extracted")
+            last_followup_field = outcome.get("followup_field")
+            last_followup_time = datetime.now()
+        else:
+            last_followup_session = None
+            last_followup_field = None
+            last_followup_time = None
+    except Exception:
+        last_followup_session = None
+        last_followup_field = None
+        last_followup_time = None
+    return outcome
+
+
 def save_to_db(entry: dict):
     """
     ── FIX 14: Never write "assumed*" prefixes into the DB.
@@ -3851,6 +4233,86 @@ async def chat(req: ChatRequest):
             "autofilled_fields": updated.get("autofilled_fields", []),
         }
 
+    # Robustness: frontend may sometimes omit followup_field when sending a
+    # short follow-up answer like "cash" or "upi". If session_data is present
+    # and looks like it's waiting on payment_method, accept single-word answers
+    # that normalize to a known payment method and treat them as follow-up.
+    # Fallback: if client omits session_data but user replies with a single
+    # payment-method token soon after the server asked for it, merge into the
+    # last recorded followup (best-effort, single-user/dev only).
+    if not req.session_data and not req.followup_field:
+        try:
+            global last_followup_session, last_followup_time, last_followup_field
+            if last_followup_session and last_followup_field == "payment_method":
+                # 2-minute expiry for safety
+                if (
+                    last_followup_time
+                    and (datetime.now() - last_followup_time).total_seconds() <= 120
+                ):
+                    pm_norm = normalize_payment_method(str(req.message or ""))
+                    if pm_norm:
+                        merged = merge_followup_answer(
+                            dict(last_followup_session),
+                            str(req.message or ""),
+                            "payment_method",
+                        )
+                        orig_q = (
+                            last_followup_session.get("original_query")
+                            if isinstance(
+                                last_followup_session.get("original_query"), str
+                            )
+                            else req.message
+                        )
+                        past = merged.get("retrieved_context") or []
+                        # clear recorded followup after applying
+                        last_followup_session = None
+                        last_followup_field = None
+                        last_followup_time = None
+                        return _prepare_and_record(merged, orig_q, past)
+        except Exception:
+            pass
+
+    if req.session_data and not req.followup_field:
+        try:
+            sess = (
+                req.session_data
+                if isinstance(req.session_data, dict)
+                else dict(req.session_data)
+            )
+            if (
+                isinstance(sess, dict)
+                and isinstance(sess.get("items"), list)
+                and len(sess.get("items") or []) > 0
+            ):
+                intent = str(sess.get("intent") or "expense").strip().lower()
+                pending_optional = OPTIONAL_FOLLOWUP_FIELDS.get(intent, [])
+                if "payment_method" in pending_optional:
+                    cur_pm = (sess.get("items") or [{}])[0].get("payment_method")
+                    if is_empty(cur_pm):
+                        pm_norm = normalize_payment_method(str(req.message or ""))
+                        if pm_norm:
+                            try:
+                                # perform merge immediately to avoid relying on client followup_field
+                                session_copy = dict(sess)
+                                merged = merge_followup_answer(
+                                    session_copy,
+                                    str(req.message or ""),
+                                    "payment_method",
+                                )
+                                original_query = (
+                                    session_copy.get("original_query")
+                                    if isinstance(
+                                        session_copy.get("original_query"), str
+                                    )
+                                    else req.message
+                                )
+                                past = merged.get("retrieved_context") or []
+                                return _prepare_and_record(merged, original_query, past)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
     # Merging a follow-up answer into existing session
     valid_followup_fields = set(REQUIRED_FIELDS)
     for optional_fields in OPTIONAL_FOLLOWUP_FIELDS.values():
@@ -3867,117 +4329,142 @@ async def chat(req: ChatRequest):
         has_valid_session_shape
         and req.followup_field
         and req.followup_field in valid_followup_fields
-        and not is_query_like_message(req.message, is_followup=True)
     ):
-        session = dict(req.session_data)
-        field = req.followup_field
-        intent = str(session.get("intent") or "").strip().lower()
-        optional_field_set = {
-            optional
-            for fields in OPTIONAL_FOLLOWUP_FIELDS.values()
-            for optional in fields
-        }
-        if field in optional_field_set:
-            allowed_optional_fields = OPTIONAL_FOLLOWUP_FIELDS.get(intent, [])
-            if field not in allowed_optional_fields:
-                past = (
-                    session.get("retrieved_context")
-                    if isinstance(session.get("retrieved_context"), list)
-                    else []
-                )
-                original_query = (
-                    req.session_data.get("original_query", "")
-                    if isinstance(req.session_data, dict)
-                    else ""
-                )
-                return prepare_chat_outcome(session, original_query, past)
-
-        answer = req.message.strip()
-        answer_lower = answer.lower()
-
-        # Also support the frontend chip 'rag_accepted' flag
-        is_rag_accepted = getattr(req, "rag_accepted", False)
-
-        # Determine the active suggestion based on existing state
-        suggestions = session.get("optional_assumption_suggestions", {})
-        rag_suggestion = suggestions.get(field)
-        has_active_suggestion = not is_empty(rag_suggestion)
-
-        # "no"/"n"/"nope" means SKIP when no suggestion is showing.
-        # "no"/"n"/"nope" means REJECT when a suggestion is showing.
-        is_skip = is_skip_answer(answer) or (
-            is_negative_answer(answer) and not has_active_suggestion
-        )
-
-        # Detect yes — accept the RAG suggestion
-        is_yes = is_affirmative_answer(answer) or answer_lower in {"sure", "✓"}
-
-        # Detect no — reject suggestion, ask for correct value as plain followup
-        is_no = (
-            is_negative_answer(answer) or answer_lower in {"not", "x", "✗"}
-        ) and has_active_suggestion
-
-        # "no cash" on a payment-method suggestion should be treated as
-        # a correction value, not a rejection-only response.
-        if (
-            has_active_suggestion
-            and field == "payment_method"
-            and re.match(r"^no\s+", answer_lower)
-        ):
-            candidate_method = re.sub(r"^no\s+", "", answer_lower).strip()
-            if normalize_payment_method(candidate_method):
-                answer = candidate_method
-                answer_lower = candidate_method.lower()
-                is_no = False
-                is_skip = False
-
-        if is_skip:
-            # Revert manual bypass of merge_followup_answer for skip, let it process properly
-            # so the field gets marked in skipped_optional_fields.
-            session = merge_followup_answer(session, answer, field)
-
-        elif (is_yes or is_rag_accepted) and not is_empty(rag_suggestion):
-            # Accept RAG suggestion
-            session = merge_followup_answer(session, str(rag_suggestion), field)
-
-        elif is_no and not is_empty(rag_suggestion):
-            # User rejected suggestion — ask plain followup for this field
-
-            # Clear suggestion for this field so it isn't asked again
-            rejected = session.get("rejected_optional_suggestion_fields")
-            if not isinstance(rejected, list):
-                rejected = []
-            if field not in rejected:
-                rejected.append(field)
-            session["rejected_optional_suggestion_fields"] = rejected
-
-            # Clear _cosine / _similarity on all entries so suggestion is not shown again
-            retrieved = session.get("retrieved_context") or []
-            for e in retrieved:
-                e["_cosine"] = None
-                e["_similarity"] = 0.0  # force below threshold
-            session["retrieved_context"] = retrieved
-
-            # Return plain followup question for same field with no suggestion
-            plain_question = generate_followup(session, field)
-            return {
-                "status": "followup",
-                "question": plain_question,
-                "followup_field": field,
-                "assumption_value": None,
-                "assumption_confidence": None,
-                "retrieval_stage": session.get("retrieval_stage", "semantic_fallback"),
-                "followup_options": ["Skip"],
-                "is_optional_followup": True,
-                "extracted": session,
-                "autofilled_fields": session.get("autofilled_fields", []),
+        if should_start_fresh_transaction(req.message):
+            # Treat the input as a brand-new transaction instead of a follow-up
+            # answer. This lets a new natural-language expense reach retrieval
+            # even if the previous draft was still waiting on an optional field.
+            has_valid_session_shape = False
+        elif not is_query_like_message(req.message, is_followup=True):
+            session = dict(req.session_data)
+            field = req.followup_field
+            intent = str(session.get("intent") or "").strip().lower()
+            optional_field_set = {
+                optional
+                for fields in OPTIONAL_FOLLOWUP_FIELDS.values()
+                for optional in fields
             }
+            if field in optional_field_set:
+                allowed_optional_fields = OPTIONAL_FOLLOWUP_FIELDS.get(intent, [])
+                if field not in allowed_optional_fields:
+                    past = (
+                        session.get("retrieved_context")
+                        if isinstance(session.get("retrieved_context"), list)
+                        else []
+                    )
+                    original_query = (
+                        req.session_data.get("original_query", "")
+                        if isinstance(req.session_data, dict)
+                        else ""
+                    )
+                    return _prepare_and_record(session, original_query, past)
+
+            answer = req.message.strip()
+            try:
+                print(
+                    f"DEBUG merging: field={field} answer={answer} session_before={session.get('items')}"
+                )
+            except Exception:
+                pass
+            answer_lower = answer.lower()
+
+            # Also support the frontend chip 'rag_accepted' flag
+            is_rag_accepted = getattr(req, "rag_accepted", False)
+
+            # Determine the active suggestion based on existing state
+            suggestions = session.get("optional_assumption_suggestions", {})
+            rag_suggestion = suggestions.get(field)
+            has_active_suggestion = not is_empty(rag_suggestion)
+
+            # "no"/"n"/"nope" means SKIP when no suggestion is showing.
+            # "no"/"n"/"nope" means REJECT when a suggestion is showing.
+            is_skip = is_skip_answer(answer) or (
+                is_negative_answer(answer) and not has_active_suggestion
+            )
+
+            # Detect yes — accept the RAG suggestion
+            is_yes = is_affirmative_answer(answer) or answer_lower in {"sure", "✓"}
+
+            # Detect no — reject suggestion, ask for correct value as plain followup
+            is_no = (
+                is_negative_answer(answer) or answer_lower in {"not", "x", "✗"}
+            ) and has_active_suggestion
+
+            # "no cash" on a payment-method suggestion should be treated as
+            # a correction value, not a rejection-only response.
+            if (
+                has_active_suggestion
+                and field == "payment_method"
+                and re.match(r"^no\s+", answer_lower)
+            ):
+                candidate_method = re.sub(r"^no\s+", "", answer_lower).strip()
+                if normalize_payment_method(candidate_method):
+                    answer = candidate_method
+                    answer_lower = candidate_method.lower()
+                    is_no = False
+                    is_skip = False
+
+            if is_skip:
+                # Revert manual bypass of merge_followup_answer for skip, let it process properly
+                # so the field gets marked in skipped_optional_fields.
+                session = merge_followup_answer(session, answer, field)
+                try:
+                    print(f"DEBUG merged skip session_after={session.get('items')}")
+                except Exception:
+                    pass
+
+            elif (is_yes or is_rag_accepted) and not is_empty(rag_suggestion):
+                # Accept RAG suggestion
+                session = merge_followup_answer(session, str(rag_suggestion), field)
+                try:
+                    print(f"DEBUG merged yes session_after={session.get('items')}")
+                except Exception:
+                    pass
+
+            elif is_no and not is_empty(rag_suggestion):
+                # User rejected suggestion — ask plain followup for this field
+
+                # Clear suggestion for this field so it isn't asked again
+                rejected = session.get("rejected_optional_suggestion_fields")
+                if not isinstance(rejected, list):
+                    rejected = []
+                if field not in rejected:
+                    rejected.append(field)
+                session["rejected_optional_suggestion_fields"] = rejected
+
+                # Clear _cosine / _similarity on all entries so suggestion is not shown again
+                retrieved = session.get("retrieved_context") or []
+                for e in retrieved:
+                    e["_cosine"] = None
+                    e["_similarity"] = 0.0  # force below threshold
+                session["retrieved_context"] = retrieved
+
+                # Return plain followup question for same field with no suggestion
+                plain_question = generate_followup(session, field)
+                return {
+                    "status": "followup",
+                    "question": plain_question,
+                    "followup_field": field,
+                    "assumption_value": None,
+                    "assumption_confidence": None,
+                    "retrieval_stage": session.get(
+                        "retrieval_stage", "semantic_fallback"
+                    ),
+                    "followup_options": ["Skip"],
+                    "is_optional_followup": True,
+                    "extracted": session,
+                    "autofilled_fields": session.get("autofilled_fields", []),
+                }
 
         else:
             # User typed a real value
             if field == "payment_method":
                 answer = normalize_payment_method(answer) or answer
             session = merge_followup_answer(session, answer, field)
+            try:
+                print(f"DEBUG merged real session_after={session.get('items')}")
+            except Exception:
+                pass
 
         # Always preserve original retrieved_context — never overwrite with empty
         existing_context = session.get("retrieved_context")
@@ -3991,7 +4478,7 @@ async def chat(req: ChatRequest):
             if isinstance(req.session_data, dict)
             else ""
         )
-        return prepare_chat_outcome(session, original_query, past)
+        return _prepare_and_record(session, original_query, past)
 
     # Fresh input: extract -> RAG -> check
     extracted = extract_fields(req.message, [])
@@ -4082,6 +4569,10 @@ async def chat(req: ChatRequest):
                 extracted["items"] = [item_for_correction]
             break
 
+    # Set original_query BEFORE retrieve_assumptions so RAG scoring can use
+    # item keyword overlap from the user's actual input text.
+    extracted["original_query"] = req.message
+
     rag_result = retrieve_assumptions(extracted)
     past = rag_result.get("matched_entries", []) if isinstance(rag_result, dict) else []
     rag_assumptions = (
@@ -4096,8 +4587,7 @@ async def chat(req: ChatRequest):
     extracted["retrieved_context"] = past
     extracted["rag_assumptions"] = rag_assumptions
     extracted["retrieval_stage"] = retrieval_stage
-    extracted["original_query"] = req.message
-    return prepare_chat_outcome(extracted, extracted["original_query"], past)
+    return _prepare_and_record(extracted, extracted["original_query"], past)
 
 
 @app.post("/save")

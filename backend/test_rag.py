@@ -619,3 +619,107 @@ class TestOptionalMerchantRanking:
 
         assert value == "Netflix", f"Got candidate: {(value, score)}"
         assert score >= 0.45, f"Got candidate: {(value, score)}"
+
+
+class TestOptionalFollowupSeeding:
+    # Validates a payment-method suggestion does not block merchant fallback.
+    def test_8_1_merchant_fallback_runs_when_other_suggestion_exists(
+        self, monkeypatch
+    ):
+        extracted = {
+            "intent": "expense",
+            "items": [
+                {
+                    "amount": 500,
+                    "category": "Health",
+                    "item": "Medicine",
+                    "merchant": None,
+                    "payment_method": None,
+                }
+            ],
+            "original_query": "spend 500 on medicine today",
+        }
+
+        monkeypatch.setattr(
+            rag_main,
+            "build_optional_assumption_suggestions",
+            lambda extracted, optional_queue, user_input: {"payment_method": "UPI"},
+        )
+        monkeypatch.setattr(
+            rag_main,
+            "detect_explicit_fields",
+            lambda user_input, extracted: set(),
+        )
+        monkeypatch.setattr(
+            rag_main,
+            "build_assumptions",
+            lambda data, past_entries, explicit_fields: (
+                {"merchant": "medkart"},
+                {"merchant": ["medkart"]},
+                ["merchant"],
+            ),
+        )
+
+        outcome = rag_main.prepare_chat_outcome(
+            extracted,
+            extracted["original_query"],
+            [{"intent": "expense", "merchant": "medkart", "item": "Medicine"}],
+        )
+
+        assert outcome["status"] == "followup", f"Got outcome: {outcome}"
+        assert outcome["followup_field"] == "merchant", f"Got outcome: {outcome}"
+        assert (
+            outcome["assumption_value"] == "medkart"
+        ), f"Got outcome: {outcome}"
+
+    # Validates merchant fallback can use broader context when the filtered pool is sparse.
+    def test_8_2_sparse_pool_still_returns_merchant(self, monkeypatch):
+        extracted = {
+            "intent": "expense",
+            "items": [
+                {
+                    "amount": 500,
+                    "category": "Health",
+                    "item": "Medicine",
+                    "merchant": None,
+                    "payment_method": None,
+                }
+            ],
+            "original_query": "spend 500 on medicine today",
+            "retrieved_context": [
+                {
+                    "intent": "expense",
+                    "merchant": "medkart",
+                    "item": "Medicine",
+                    "category": "Health",
+                    "payment_method": "UPI",
+                    "datetime": "2026-04-27T12:00:00",
+                    "_similarity": 0.32,
+                }
+            ],
+        }
+
+        monkeypatch.setattr(
+            rag_main,
+            "build_optional_assumption_suggestions",
+            lambda extracted, optional_queue, user_input: {"payment_method": "UPI"},
+        )
+        monkeypatch.setattr(
+            rag_main,
+            "detect_explicit_fields",
+            lambda user_input, extracted: set(),
+        )
+        monkeypatch.setattr(
+            rag_main,
+            "build_assumptions",
+            lambda data, past_entries, explicit_fields: ({}, {}, []),
+        )
+
+        outcome = rag_main.prepare_chat_outcome(
+            extracted,
+            extracted["original_query"],
+            extracted["retrieved_context"],
+        )
+
+        assert outcome["followup_field"] == "merchant", f"Got outcome: {outcome}"
+        assert outcome["assumption_value"] == "medkart", f"Got outcome: {outcome}"

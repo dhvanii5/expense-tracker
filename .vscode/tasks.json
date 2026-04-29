@@ -1,0 +1,333 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Seed demo memory",
+			"type": "shell",
+			"command": "cd backend; python seed.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check seeded memory",
+			"type": "shell",
+			"command": "cd backend; python -c \"import sqlite3; conn=sqlite3.connect('finance_memory/chroma.sqlite3'); cur=conn.cursor(); print(cur.execute(\\\"select count(*) from embedding_metadata where lower(string_value)='dmart'\\\").fetchone()[0]); print(cur.execute(\\\"select count(*) from embedding_metadata where lower(string_value)='apollo pharmacy'\\\").fetchone()[0])\"",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check seeded memory 2",
+			"type": "shell",
+			"command": "cd backend; python -c 'import sqlite3; conn=sqlite3.connect(\"finance_memory/chroma.sqlite3\"); cur=conn.cursor(); print(cur.execute(\"select count(*) from embedding_metadata where lower(string_value)=?\", (\"dmart\",)).fetchone()[0]); print(cur.execute(\"select count(*) from embedding_metadata where lower(string_value)=?\", (\"apollo pharmacy\",)).fetchone()[0])'",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile backend main",
+			"type": "shell",
+			"command": "d:/SLM/expense-tracker/.venv/Scripts/python.exe -m py_compile backend/main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile backend after cache fix",
+			"type": "shell",
+			"command": "d:/SLM/expense-tracker/.venv/Scripts/python.exe -m py_compile backend/main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Debug groceries retrieval",
+			"type": "shell",
+			"command": "d:/SLM/expense-tracker/.venv/Scripts/python.exe -c \"import requests, json; base='http://127.0.0.1:8000';\nfor path,payload in [('/debug', {'message':'spend 40 on groceries today'}), ('/transactions', None)]:\n    if payload is None:\n        r=requests.get(base+path, timeout=30)\n    else:\n        r=requests.post(base+path, json=payload, timeout=30)\n    print('PATH', path, 'STATUS', r.status_code)\n    print(r.text[:4000])\n    print('---')\n\"",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Live debug groceries",
+			"type": "shell",
+			"command": "d:/SLM/expense-tracker/.venv/Scripts/python.exe -c \"import requests; r=requests.post('http://127.0.0.1:8000/debug', json={'message':'spend 40 on groceries today'}, timeout=30); print(r.status_code); print(r.text)\"",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run tmp debug script",
+			"type": "shell",
+			"command": "cd backend; python _tmp_debug.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check live transactions",
+			"type": "shell",
+			"command": "cd backend; python _tmp_tx.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile after retrieval fix",
+			"type": "shell",
+			"command": "d:/SLM/expense-tracker/.venv/Scripts/python.exe -m py_compile backend/main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Rerun live debug",
+			"type": "shell",
+			"command": "cd backend; python _tmp_debug.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Direct retrieval call",
+			"type": "shell",
+			"command": "cd backend; python _tmp_direct.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check raw merchant score",
+			"type": "shell",
+			"command": "cd backend; python _tmp_score.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Manual lexical branch test",
+			"type": "shell",
+			"command": "cd backend; python _tmp_manual.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Trace retrieval exception",
+			"type": "shell",
+			"command": "cd backend; python _tmp_direct.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile after fallback unblock",
+			"type": "shell",
+			"command": "d:/SLM/expense-tracker/.venv/Scripts/python.exe -m py_compile backend/main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Verify retrieval after unblock",
+			"type": "shell",
+			"command": "cd backend; python _tmp_direct.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile after model wiring",
+			"type": "shell",
+			"command": "d:/SLM/expense-tracker/.venv/Scripts/python.exe -m py_compile backend/main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check live model and retrieval",
+			"type": "shell",
+			"command": "cd backend; python _check_model.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Recheck model with longer timeout",
+			"type": "shell",
+			"command": "cd backend; python _check_model.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check health and local extract",
+			"type": "shell",
+			"command": "cd backend; python _check_health.py; python _check_extract.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run direct model inference",
+			"type": "shell",
+			"command": "cd backend; python _check_llm.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile backend after latency patch",
+			"type": "shell",
+			"command": "cd backend; python -m py_compile main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Time heuristic extraction",
+			"type": "shell",
+			"command": "cd backend; python -c \"import time, main; t=time.time(); print(main.extract_fields('spent 300 on groceries today', [])); print('elapsed', round(time.time()-t, 4))\"",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Time heuristic extraction",
+			"type": "shell",
+			"command": "cd backend; python -c 'import time, main; t=time.time(); print(main.extract_fields(\"spent 300 on groceries today\", [])); print(\"elapsed\", round(time.time()-t, 4))'",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Time fast-path vs query",
+			"type": "shell",
+			"command": "cd backend; python _time_fast.py; python _time_query.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run followup repro",
+			"type": "shell",
+			"command": "cd backend; python _repro_followup.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile after auto-merge patch",
+			"type": "shell",
+			"command": "cd backend; python -m py_compile main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run repro missing followup",
+			"type": "shell",
+			"command": "cd backend; python _repro_missing_followup.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run auto-merge check",
+			"type": "shell",
+			"command": "cd backend; python _check_auto_merge.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run repro missing followup with debug",
+			"type": "shell",
+			"command": "cd backend; python _repro_missing_followup.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run repro with merge debug",
+			"type": "shell",
+			"command": "cd backend; python _repro_missing_followup.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run repro spned",
+			"type": "shell",
+			"command": "cd backend; python _repro_spned.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile after immediate-merge patch",
+			"type": "shell",
+			"command": "cd backend; python -m py_compile main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run repro spned after immediate merge",
+			"type": "shell",
+			"command": "cd backend; python _repro_spned.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run repro pvr after immediate merge",
+			"type": "shell",
+			"command": "cd backend; python _repro_followup.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile after last-followup patch",
+			"type": "shell",
+			"command": "cd backend; python -m py_compile main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run repro no-session flow",
+			"type": "shell",
+			"command": "cd backend; python -c \"import asyncio, json, main\\n# Step 1: send initial message and get followup (no client session stored)\\nreq1 = type('R', (), {'message':'pay 599 for moview tickets at pvr 3days back','session_data':None,'followup_field':None,'assumption_action':None,'edited_assumptions':None,'rejected_assumptions':None,'selected_assumption_options':None})\\nres1 = asyncio.get_event_loop().run_until_complete(main.chat(req1))\\nprint('Initial response:', json.dumps(res1, indent=2))\\n# Step 2: user replies 'upi' but client sends no session_data\\nreq2 = type('R', (), {'message':'upi','session_data':None,'followup_field':None,'assumption_action':None,'edited_assumptions':None,'rejected_assumptions':None,'selected_assumption_options':None})\\nres2 = asyncio.get_event_loop().run_until_complete(main.chat(req2))\\nprint('After upi:', json.dumps(res2, indent=2))\"",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run repro no-session script",
+			"type": "shell",
+			"command": "cd backend; python _repro_no_session.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Compile after followup fix",
+			"type": "shell",
+			"command": "cd backend; python -m py_compile main.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run session-missing-field repro",
+			"type": "shell",
+			"command": "cd backend; python _repro_session_missing_field.py",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
