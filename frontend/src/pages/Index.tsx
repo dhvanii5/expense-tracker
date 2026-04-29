@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { ChatMessage, TransactionDraft } from '@/types/chat';
-import { chatWithBackend, draftToEntry, extractedToDraft, fetchTransactions, saveTransaction } from '@/lib/api';
+import { chatWithBackend, deleteTransaction, draftToEntry, extractedToDraft, fetchTransactions, saveTransaction } from '@/lib/api';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { ChatInput } from '@/components/chat/ChatInput';
 import { TypingIndicator } from '@/components/chat/TypingIndicator';
@@ -158,6 +158,26 @@ export default function Index() {
     });
   }, []);
 
+  const handleDeleteTransaction = useCallback(async (id: string) => {
+    try {
+      await deleteTransaction(id);
+      setConfirmedTransactions(prev => prev.filter((tx) => tx.id !== id));
+      addMessage({
+        id: crypto.randomUUID(),
+        role: 'ai',
+        content: 'Transaction deleted successfully.',
+        timestamp: new Date(),
+      });
+    } catch {
+      addMessage({
+        id: crypto.randomUUID(),
+        role: 'ai',
+        content: 'I could not delete that transaction right now. Please try again.',
+        timestamp: new Date(),
+      });
+    }
+  }, []);
+
   return (
     <div className="flex h-screen bg-background overflow-hidden">
       {/* Main Chat Area */}
@@ -208,7 +228,7 @@ export default function Index() {
       {/* Right Sidebar - Recent Transactions */}
       <aside className={`${sidebarOpen ? 'translate-x-0' : 'translate-x-full'} md:translate-x-0 fixed md:static right-0 top-0 h-full z-30 w-72 border-l bg-card p-4 transition-transform duration-200 overflow-y-auto scrollbar-thin`}>
         <h2 className="text-sm font-semibold mb-4">Recent Transactions</h2>
-        <RecentTransactions transactions={confirmedTransactions} />
+        <RecentTransactions transactions={confirmedTransactions} onDelete={handleDeleteTransaction} />
       </aside>
 
       {/* Mobile overlay */}

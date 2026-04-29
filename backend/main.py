@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
+import logging
 import json
 import re
 import uuid
@@ -10,36 +11,84 @@ from datetime import datetime, timedelta
 import math
 import time
 import os
-import ollama
+import warnings
 import chromadb
-from sentence_transformers import SentenceTransformer
-from llama_cpp import Llama
+
+_SentenceTransformer = None
+
+try:
+    from llama_cpp import Llama  # type: ignore[import-not-found]
+except ModuleNotFoundError:
+    Llama = None
+
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # ── Global variables for models and db ─────────────────────────────────────────
 embed_model = None
 chroma_client = None
 collection = None
 llm = None
+_embed_model_load_attempted = False
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global embed_model, chroma_client, collection
-    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+def ensure_collection():
+    global chroma_client, collection
+    if collection is not None:
+        return collection
+
     chroma_client = chromadb.PersistentClient(path="./finance_memory")
     collection = chroma_client.get_or_create_collection(
         "transactions", metadata={"hf:space": "cosine"}
     )
-    
-    print(f"Loading local LLM from {MODEL_PATH} ...")
-    llm = Llama(
-        model_path=MODEL_PATH,
-        n_ctx=384,
-        n_batch=128,
-        n_gpu_layers=0,
-        verbose=False,
+    return collection
+
+
+def ensure_embed_model():
+    global embed_model, _embed_model_load_attempted, _SentenceTransformer
+    if embed_model is not None:
+        return embed_model
+    if _embed_model_load_attempted:
+        return None
+
+    _embed_model_load_attempted = True
+    if _SentenceTransformer is None:
+        try:
+            from sentence_transformers import (
+                SentenceTransformer as sentence_transformer_cls,
+            )
+
+            _SentenceTransformer = sentence_transformer_cls
+            try:
+                from transformers.utils import logging as transformers_logging
+
+                transformers_logging.set_verbosity_error()
+                logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"⚠️ sentence_transformers unavailable: {e}")
+            return None
+
+    try:
+        embed_model = _SentenceTransformer(EMBED_MODEL_NAME, local_files_only=True)
+    except Exception:
+        try:
+            embed_model = _SentenceTransformer(EMBED_MODEL_NAME)
+        except Exception as e:
+            print(f"⚠️ Failed to initialize embedding model: {e}")
+            embed_model = None
+    return embed_model
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global embed_model, chroma_client, collection, llm
+    warnings.filterwarnings(
+        "ignore",
+        message=r"You are sending unauthenticated requests to the HF Hub.*",
     )
-    print("✅ Local LLM ready")
+    # Heavy dependencies are initialized lazily so the API can bind immediately.
+    llm = None
     yield
 
 
@@ -53,13 +102,8 @@ app.add_middleware(
 )
 
 MODEL_PATH = "d:/expense tracker/model/expense_1.5b.Q4_K_M.gguf"
+MODEL_NAME = os.path.basename(MODEL_PATH)
 CHATML_TEMPLATE = "<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
-
-OLLAMA_FAST_OPTIONS = {
-    "num_predict": 80,  # reduce from 128 — JSON output is short
-    "num_ctx": 512,  # reduce from 1536 — your prompt is small
-    "temperature": 0.05,
-}
 
 # Canonical schema consumed by business logic regardless of model output quirks.
 CANONICAL_SCHEMA = {
@@ -145,6 +189,30 @@ OPTIONAL_FOLLOWUP_FIELDS = {
 SKIP_ANSWER_TOKENS = {"skip", "none", "na", "n/a", "no", "not now", "later"}
 YES_ANSWER_TOKENS = {"yes", "y", "yeah", "yep", "correct", "right", "ok", "okay"}
 NO_ANSWER_TOKENS = {"no", "n", "nope", "wrong", "incorrect"}
+
+# Income/source phrases that should not be treated as payer names.
+INCOME_SOURCE_LIKE_TERMS = {
+    "income",
+    "salary",
+    "bonus",
+    "refund",
+    "cashback",
+    "interest",
+    "investment",
+    "business",
+    "rent",
+    "gift",
+    "freelance",
+    "freelancing",
+    "freelancer",
+    "project",
+    "projects",
+    "gig",
+    "payment",
+    "payments",
+    "client",
+    "clients",
+}
 
 # Minimum semantic similarity for keyword-boosted retrieval.
 ASSUMPTION_SIMILARITY_THRESHOLD = 0.55
@@ -253,6 +321,7 @@ CATEGORY_KEYWORDS = {
         "restaurant",
         "zomato",
         "swiggy",
+        "starbucks",
     ],
     "Transport": [
         "petrol",
@@ -394,6 +463,40 @@ def normalize_payment_method(raw: str) -> Optional[str]:
     return raw.strip().title()
 
 
+def _normalize_answer_text(answer: str) -> str:
+    cleaned = re.sub(r"[^a-z\s]", " ", str(answer or "").lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def is_affirmative_answer(answer: str) -> bool:
+    cleaned = _normalize_answer_text(answer)
+    if not cleaned:
+        return False
+    first = cleaned.split()[0]
+    if first in YES_ANSWER_TOKENS:
+        return True
+    return bool(re.fullmatch(r"ye+s+", first))
+
+
+def is_negative_answer(answer: str) -> bool:
+    cleaned = _normalize_answer_text(answer)
+    if not cleaned:
+        return False
+    first = cleaned.split()[0]
+    if first in NO_ANSWER_TOKENS:
+        return True
+    return bool(re.fullmatch(r"no+|nah+|nop+e?", first))
+
+
+def is_skip_answer(answer: str) -> bool:
+    cleaned = _normalize_answer_text(answer)
+    if not cleaned:
+        return False
+    first = cleaned.split()[0]
+    return first in SKIP_ANSWER_TOKENS
+
+
 def empty_item() -> dict:
     return {
         "amount": None,
@@ -462,6 +565,7 @@ def coerce_amount(val) -> Optional[float]:
 
 def coerce_datetime(val, user_input: str) -> Optional[str]:
     """Normalize datetime to ISO-like output using value or user-input hints."""
+
     def parse_relative_datetime_hint(text: str) -> Optional[str]:
         lower = (text or "").lower()
         now = datetime.now()
@@ -469,30 +573,56 @@ def coerce_datetime(val, user_input: str) -> Optional[str]:
         if "today" in lower or "now" in lower or "just now" in lower:
             return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         if "yesterday" in lower:
-            return (now - timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).isoformat()
+            return (
+                (now - timedelta(days=1))
+                .replace(hour=0, minute=0, second=0, microsecond=0)
+                .isoformat()
+            )
         if "tomorrow" in lower:
-            return (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).isoformat()
+            return (
+                (now + timedelta(days=1))
+                .replace(hour=0, minute=0, second=0, microsecond=0)
+                .isoformat()
+            )
         if "this week" in lower:
-            return (now - timedelta(days=now.weekday())).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).isoformat()
+            return (
+                (now - timedelta(days=now.weekday()))
+                .replace(hour=0, minute=0, second=0, microsecond=0)
+                .isoformat()
+            )
 
-        # Tolerates common typos like "dayss back" / "weekss ago".
-        days_ago = re.search(r"\b(\d+)\s+day(?:s|ss)?\s+(ago|back)\b", lower)
-        if days_ago:
-            return (now - timedelta(days=int(days_ago.group(1)))).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).isoformat()
-
-        weeks_ago = re.search(r"\b(\d+)\s+week(?:s|ss)?\s+(ago|back)\b", lower)
-        if weeks_ago:
-            return (now - timedelta(weeks=int(weeks_ago.group(1)))).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).isoformat()
+        # Supports numeric and worded forms like "2 months back" and "two years ago".
+        word_to_num = {
+            "a": 1,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+        ago_match = re.search(
+            r"\b(\d+|a|one|two|three|four|five|six|seven|eight|nine|ten)\s*"
+            r"(day(?:s|ss)?|week(?:s|ss)?|month(?:s|ss)?|year(?:s|ss)?)\s+(ago|back)\b",
+            lower,
+        )
+        if ago_match:
+            raw_num = ago_match.group(1)
+            value = int(raw_num) if raw_num.isdigit() else word_to_num.get(raw_num, 1)
+            unit = ago_match.group(2)
+            if unit.startswith("day"):
+                target = now - timedelta(days=value)
+            elif unit.startswith("week"):
+                target = now - timedelta(weeks=value)
+            elif unit.startswith("month"):
+                target = now - timedelta(days=30 * value)
+            else:
+                target = now - timedelta(days=365 * value)
+            return target.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
         weekdays = [
             "monday",
@@ -506,9 +636,11 @@ def coerce_datetime(val, user_input: str) -> Optional[str]:
         for idx, day_name in enumerate(weekdays):
             if f"last {day_name}" in lower:
                 days_behind = (now.weekday() - idx) % 7 or 7
-                return (now - timedelta(days=days_behind)).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                ).isoformat()
+                return (
+                    (now - timedelta(days=days_behind))
+                    .replace(hour=0, minute=0, second=0, microsecond=0)
+                    .isoformat()
+                )
 
         return None
 
@@ -679,7 +811,7 @@ def normalize_model_output(raw: dict, user_input: str) -> dict:
             elif any(w in text for w in ["business", "profit", "sales"]):
                 item["source"] = "Business"
             elif any(w in text for w in ["refund", "cashback", "cash back"]):
-                item["source"] = "Refund/Cashback"
+                item["source"] = "Refund"
             elif "rent" in text:
                 item["source"] = "Rent"
             elif "scholarship" in text:
@@ -688,6 +820,26 @@ def normalize_model_output(raw: dict, user_input: str) -> dict:
                 item["source"] = item["category"]
             else:
                 item["source"] = "Income"
+
+        normalized_source = normalize_income_source_value(
+            item.get("source") or item.get("category"), user_input
+        )
+        if normalized_source:
+            item["source"] = normalized_source
+            if is_empty(item.get("category")):
+                item["category"] = normalized_source
+            if is_empty(item.get("item")):
+                item["item"] = normalized_source
+        elif str(item.get("source") or "").strip().lower() in {
+            "income",
+            "other income",
+            "general income",
+        }:
+            item["source"] = None
+            if str(item.get("category") or "").strip().lower() == "income":
+                item["category"] = None
+            if str(item.get("item") or "").strip().lower() == "income":
+                item["item"] = None
 
     data["items"] = [item]
     return apply_transaction_hints(user_input, data)
@@ -829,14 +981,38 @@ def looks_like_transaction_statement(text: str) -> bool:
         "booked",
         "purchased",
         "purchase",
+        "bout",
     ]
     return starts_with_phrase(text, transaction_starters)
 
 
 def infer_transaction_intent(text: str) -> Optional[str]:
+    normalized = (text or "").lower()
+
+    # Pattern-first handling for person-to-person transfers and repayments.
+    if has_amount(normalized):
+        if re.search(r"\b(receive|received|recieve|recieved)\b", normalized):
+            return "income"
+        if re.search(r"\b(gave|sent|paid)\s+me\b", normalized):
+            return "income"
+        if re.search(
+            r"\b(paid me back|sent me back|gave me back|paid me|sent me|credited to me|receive from|received from)\b",
+            normalized,
+        ):
+            return "income"
+        if re.search(r"\b(refunded|refund received|cashback received)\b", normalized):
+            return "income"
+        if (
+            re.search(r"\b(gave|sent|paid)\s+[a-z][a-z0-9&'.\- ]{1,30}\b", normalized)
+            and " me " not in f" {normalized} "
+        ):
+            return "expense"
+
     income_starters = [
+        "receive",
         "received",
         "recieved",
+        "i receive",
         "got",
         "earned",
         "income",
@@ -856,6 +1032,8 @@ def infer_transaction_intent(text: str) -> Optional[str]:
         "freelance",
         "payment received",
         "got payment",
+        "refunded",
+        "cashback",
     ]
     expense_starters = [
         "spent",
@@ -878,15 +1056,34 @@ def infer_transaction_intent(text: str) -> Optional[str]:
         "i paid",
         "i pay",
         "i bought",
+        "gave",
+        "i gave",
+        "sent",
+        "i sent",
+        "gym membership",
+        "bout",
     ]
     if starts_with_phrase(text, income_starters):
         return "income"
     if starts_with_phrase(text, expense_starters):
         return "expense"
 
-    normalized = (text or "").lower()
     if has_amount(normalized):
-        income_markers = ["salary", "received", "credited", "income", "bonus", "refund", "freelance", "payment"]
+        income_markers = [
+            "receive",
+            "salary",
+            "received",
+            "credited",
+            "income",
+            "bonus",
+            "refund",
+            "cashback",
+            "freelance",
+            "payment",
+            "gave me",
+            "paid me back",
+            "sent me",
+        ]
         expense_markers = [
             "petrol",
             "fuel",
@@ -902,9 +1099,20 @@ def infer_transaction_intent(text: str) -> Optional[str]:
             "bill",
             "netflix",
             "spotify",
+            "coffee",
+            "starbucks",
+            "gym",
+            "membership",
+            "gave",
+            "sent",
         ]
         if any(m in normalized for m in income_markers):
             return "income"
+        all_expense_keywords = {
+            k for words in CATEGORY_KEYWORDS.values() for k in words
+        }
+        if any(k in normalized for k in all_expense_keywords):
+            return "expense"
         if any(m in normalized for m in expense_markers):
             return "expense"
 
@@ -919,6 +1127,10 @@ def infer_income_source(text: str) -> Optional[str]:
         "refund": "Refund",
         "interest": "Interest",
         "freelance": "Freelance",
+        "freelancing": "Freelance",
+        "freelancer": "Freelance",
+        "project": "Freelance",
+        "gig": "Freelance",
         "cashback": "Cashback",
         "gift": "Gift",
         "rent": "Rent",
@@ -927,6 +1139,48 @@ def infer_income_source(text: str) -> Optional[str]:
         if keyword in normalized:
             return label
     return None
+
+
+def normalize_income_source_value(
+    raw_source: Optional[str], user_text: str
+) -> Optional[str]:
+    """Normalize source labels and prefer user-text inference over model mashups."""
+    inferred = infer_income_source(user_text)
+    if inferred:
+        return inferred
+
+    normalized = str(raw_source or "").strip().lower()
+    if not normalized or normalized in FILLER_VALUES:
+        return None
+    if normalized in {"income", "other income", "other", "general income"}:
+        return None
+
+    if "cashback" in normalized and "refund" not in normalized:
+        return "Cashback"
+    if "refund" in normalized and "cashback" not in normalized:
+        return "Refund"
+    if "refund" in normalized and "cashback" in normalized:
+        return "Refund"
+
+    aliases = {
+        "salary": "Salary",
+        "bonus": "Bonus",
+        "refund": "Refund",
+        "interest": "Interest",
+        "freelance": "Freelance",
+        "freelancing": "Freelance",
+        "freelancer": "Freelance",
+        "project": "Freelance",
+        "gig": "Freelance",
+        "cashback": "Cashback",
+        "gift": "Gift",
+        "rent": "Rent",
+    }
+    for key, label in aliases.items():
+        if key in normalized:
+            return label
+
+    return str(raw_source).strip().title()
 
 
 def infer_expense_category(text: str, item_name: Optional[str] = None) -> Optional[str]:
@@ -949,7 +1203,7 @@ def infer_income_payer(text: str) -> Optional[str]:
 
     # Pattern: [Name] paid me / [Name] sent me
     match_payer = re.search(
-        r"^([a-zA-Z0-9][a-zA-Z0-9&'.\- ]{1,30}?)\s+(?:paid|sent)\s+me\b",
+        r"^([a-zA-Z0-9][a-zA-Z0-9&'.\- ]{1,30}?)\s+(?:paid|sent|gave)\s+me\b",
         normalized,
         re.IGNORECASE,
     )
@@ -957,6 +1211,19 @@ def infer_income_payer(text: str) -> Optional[str]:
         payer = match_payer.group(1).strip(" .,-")
         if payer and payer.lower() not in {"someone", "friend", "i", "he", "she"}:
             return payer.title()
+
+    # Pattern: received/got/from [Name]
+    match_from = re.search(
+        r"\b(?:from)\s+([a-zA-Z][a-zA-Z0-9&'.\- ]{1,30}?)(?=\s+(?:today|yesterday|for|via|using|with|by|on|in|rs\.?|inr|rupees?|\d)|$)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match_from:
+        payer = match_from.group(1).strip(" .,-")
+        payer_lower = payer.lower()
+        if payer and payer_lower not in {"someone", "friend", "i", "he", "she"}:
+            if payer_lower not in INCOME_SOURCE_LIKE_TERMS:
+                return payer.title()
 
     return infer_explicit_merchant(text)
 
@@ -966,6 +1233,27 @@ def infer_explicit_merchant(text: str) -> Optional[str]:
     normalized = re.sub(r"\s+", " ", (text or "").strip())
     if not normalized:
         return None
+
+    # Person-to-person expense pattern: "paid ... (back) to Rahul"
+    # This avoids irrelevant merchant suggestions (e.g. Starbucks) for repayments.
+    pay_to_pattern = (
+        r"\b(?:paid|pay|sent|send|gave|give|transferred|transfer|returned|return)\b"
+        r"(?:\s+\d+(?:[.,]\d+)?(?:\s*(?:rs\.?|inr|rupees?))?)?"
+        r"(?:\s+back)?\s+to\s+([a-zA-Z][a-zA-Z0-9&'.\- ]{1,40}?)"
+        r"(?=\s+(?:today|yesterday|for|via|using|with|by|on|in|at|rs\.?|inr|rupees?|\d)|$)"
+    )
+    pay_to_match = re.search(pay_to_pattern, normalized, re.IGNORECASE)
+    if pay_to_match:
+        merchant = pay_to_match.group(1).strip(" .,-")
+        if merchant and merchant.lower() not in {
+            "me",
+            "myself",
+            "him",
+            "her",
+            "them",
+            "someone",
+        }:
+            return merchant.title()
 
     # Prefer structured capture after 'from'/'at'
     pattern = (
@@ -1054,6 +1342,17 @@ def has_explicit_remarks(text: str) -> bool:
     normalized = (text or "").lower()
     markers = ["note", "remark", "comment", "because", "reason"]
     return any(marker in normalized for marker in markers)
+
+
+def has_explicit_bill_reference(text: str) -> bool:
+    normalized = (text or "").lower()
+    return bool(
+        re.search(
+            r"\b(?:bill|invoice|receipt|reciept|recipt|receit|txn|transaction|order)\b",
+            normalized,
+        )
+        or re.search(r"#\s*[a-z0-9\-/]{2,}", normalized)
+    )
 
 
 def infer_expense_item(text: str) -> Optional[str]:
@@ -1323,28 +1622,55 @@ def apply_transaction_hints(user_input: str, data: dict) -> dict:
                 item["payment_method"] = normalize_payment_method(str(raw_pm))
 
     if data.get("intent") == "income":
-        inferred_source = infer_income_source(user_input)
-        if inferred_source:
+        normalized_source = normalize_income_source_value(
+            item.get("source") or item.get("category"), user_input
+        )
+        if normalized_source:
+            item["source"] = normalized_source
             if (
                 not item.get("source")
                 or str(item.get("source")).strip().lower() in FILLER_VALUES
             ):
-                item["source"] = inferred_source
+                item["source"] = normalized_source
             if (
                 not item.get("category")
                 or str(item.get("category")).strip().lower() in FILLER_VALUES
             ):
-                item["category"] = inferred_source
+                item["category"] = normalized_source
             if (
                 not item.get("item")
                 or str(item.get("item")).strip().lower() in FILLER_VALUES
             ):
-                item["item"] = inferred_source
-        
+                item["item"] = normalized_source
+
+        # If model placed a source-like token into payer (e.g. "freelancing"),
+        # promote it to source and clear payer.
+        current_payer = str(item.get("payer") or "").strip()
+        if current_payer:
+            source_from_payer = infer_income_source(current_payer)
+            if source_from_payer:
+                if not normalized_source:
+                    item["source"] = source_from_payer
+                    if is_empty(item.get("category")):
+                        item["category"] = source_from_payer
+                    if is_empty(item.get("item")):
+                        item["item"] = source_from_payer
+                item["payer"] = None
+
         # ── FIX: Better Payer Extraction for Income
         inferred_payer = infer_income_payer(user_input)
-        if inferred_payer and is_empty(item.get("payer")):
-            item["payer"] = inferred_payer
+        if inferred_payer:
+            source_from_payer_text = infer_income_source(inferred_payer)
+            if source_from_payer_text:
+                if is_empty(item.get("source")):
+                    item["source"] = source_from_payer_text
+                if is_empty(item.get("category")):
+                    item["category"] = source_from_payer_text
+                if is_empty(item.get("item")):
+                    item["item"] = source_from_payer_text
+                item["payer"] = None
+            elif is_empty(item.get("payer")):
+                item["payer"] = inferred_payer
 
     elif data.get("intent") == "expense":
         # Use the intelligent item resolver: prioritize user-text inference, then model output
@@ -1464,23 +1790,44 @@ def apply_transaction_hints(user_input: str, data: dict) -> dict:
                 item["category"] = category
                 break
 
-    # Never auto-generate remarks: keep only user-explicit remark intent.
+    # Auto-generate remarks from transaction context when not explicitly provided.
     raw_remarks = item.get("remarks")
     unsafe_markers = ["not supported", "unsupported", "internal", "error"]
-    if not has_explicit_remarks(user_input):
-        item["remarks"] = None
-    elif raw_remarks is not None:
-        remarks_text = str(raw_remarks).strip()
-        if (
-            not remarks_text
-            or remarks_text.lower() in FILLER_VALUES
-            or any(marker in remarks_text.lower() for marker in unsafe_markers)
-        ):
-            item["remarks"] = None
+    if has_explicit_remarks(user_input):
+        # User explicitly mentioned remarks/notes
+        if raw_remarks is not None:
+            remarks_text = str(raw_remarks).strip()
+            if (
+                not remarks_text
+                or remarks_text.lower() in FILLER_VALUES
+                or any(marker in remarks_text.lower() for marker in unsafe_markers)
+            ):
+                item["remarks"] = None
+            else:
+                item["remarks"] = remarks_text
         else:
-            item["remarks"] = remarks_text
+            item["remarks"] = None
     else:
-        item["remarks"] = None
+        # No explicit remarks in user input — auto-generate from context
+        item["remarks"] = auto_generate_remarks(user_input, data, item)
+
+    # Extract bill number directly from user input and override hallucinated values.
+    try:
+        import sys, os
+
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if parent_dir not in sys.path:
+            sys.path.append(parent_dir)
+        from time_parser import parse_bill_no
+
+        extracted_bill = parse_bill_no(user_input)
+        if extracted_bill:
+            item["bill_no"] = extracted_bill
+        elif not has_explicit_bill_reference(user_input):
+            # No bill marker in raw text: drop model hallucinations like "BER".
+            item["bill_no"] = None
+    except Exception:
+        pass
 
     # Resolve relative datetime phrases during first extraction (before missing-field checks).
     dt_value = item.get("datetime")
@@ -1570,11 +1917,24 @@ def parse_relative_datetime_point(text: str) -> Optional[str]:
         ).isoformat()
 
     ago_match = re.search(
-        r"\b(\d+|a|one|two|three|four|five|six|seven|eight|nine|ten)\s+(day|week|month|year)s?\s+(ago|back)\b", normalized
+        r"\b(\d+|a|one|two|three|four|five|six|seven|eight|nine|ten)\s+(day|week|month|year)s?\s+(ago|back)\b",
+        normalized,
     )
     if ago_match:
         val_str = ago_match.group(1)
-        word_to_num = {"a": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+        word_to_num = {
+            "a": 1,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
         value = int(val_str) if val_str.isdigit() else word_to_num[val_str]
         unit = ago_match.group(2)
         if unit == "day":
@@ -1763,8 +2123,8 @@ def extract_fields(user_input: str, context: list = []) -> dict:
     try:
         t1 = time.time()
         if llm is None:
-             raise RuntimeError("Local LLM not initialized")
-             
+            raise RuntimeError("Local LLM not initialized")
+
         response = llm(
             chat_prompt,
             max_tokens=256,
@@ -1967,7 +2327,7 @@ def merge_followup_answer(existing: dict, answer: str, field: str) -> dict:
 
     if field in optional_fields:
         assumed_value = optional_suggestions.get(field)
-        if assumed_value and normalized_answer in YES_ANSWER_TOKENS:
+        if assumed_value and is_affirmative_answer(answer):
             if field == "payment_method":
                 item[field] = normalize_payment_method(str(assumed_value))
             else:
@@ -1982,14 +2342,14 @@ def merge_followup_answer(existing: dict, answer: str, field: str) -> dict:
                 )
             return existing
 
-        if assumed_value and normalized_answer in NO_ANSWER_TOKENS:
+        if assumed_value and is_negative_answer(answer):
             if field not in rejected_suggestion_fields:
                 rejected_suggestion_fields.append(field)
             existing["rejected_optional_suggestion_fields"] = rejected_suggestion_fields
             existing["items"] = [item]
             return existing
 
-        if normalized_answer in SKIP_ANSWER_TOKENS:
+        if is_skip_answer(answer):
             item[field] = None
             existing["items"] = [item]
             if field not in skipped:
@@ -2220,9 +2580,11 @@ def _score_optional_candidate(
 ) -> float:
     base = float(entry.get("_similarity") or 0.0)
     query_tokens = _tokenize_match_text(query_text)
-    focus_tokens = _tokenize_match_text(
-        " ".join(filter(None, [item_text, category_text]))
-    )
+    item_tokens = _tokenize_match_text(item_text)
+    category_tokens = _tokenize_match_text(category_text)
+    focus_tokens = item_tokens | category_tokens
+    entry_item_tokens = _tokenize_match_text(str(entry.get("item") or ""))
+    entry_category_tokens = _tokenize_match_text(str(entry.get("category") or ""))
     entry_context_tokens = _tokenize_match_text(
         " ".join(
             filter(
@@ -2241,16 +2603,30 @@ def _score_optional_candidate(
             str(entry.get("merchant") or entry.get("payer") or "")
         )
         score = base
-        focus_overlap = _jaccard_similarity(focus_tokens, entry_context_tokens)
-        score += 0.65 * focus_overlap
-        score += 0.35 * _jaccard_similarity(query_tokens, candidate_tokens)
-        if query_tokens & candidate_tokens:
-            score += 0.15
+        item_overlap = _jaccard_similarity(item_tokens, entry_item_tokens)
+        category_overlap = _jaccard_similarity(category_tokens, entry_category_tokens)
+        context_overlap = _jaccard_similarity(focus_tokens, entry_context_tokens)
 
-        # Guardrail: if user gave a concrete item and there is no item/context
-        # overlap with this past entry, do not suggest merchant from this row.
-        if focus_tokens and focus_overlap < 0.20:
-            score = min(score, 0.44)
+        score += 0.85 * item_overlap
+        score += 0.20 * category_overlap
+        score += 0.15 * context_overlap
+        score += 0.20 * _jaccard_similarity(query_tokens, candidate_tokens)
+        if query_tokens & candidate_tokens:
+            score += 0.08
+
+        # Guardrail: when user gave a concrete item (dinner/coffee/rice/cab),
+        # require some item-level overlap before suggesting a merchant.
+        if item_tokens and item_overlap < 0.20:
+            score = min(score, 0.46)
+
+        # Category-only matches should not dominate merchant predictions.
+        if (
+            category_tokens
+            and category_overlap > 0
+            and item_tokens
+            and item_overlap == 0
+        ):
+            score = min(score, 0.48)
 
         return score
 
@@ -2282,9 +2658,8 @@ def _pick_optional_candidate(
     item_text: str = "",
     category_text: str = "",
 ) -> tuple[Optional[str], float]:
-    best_value = None
-    best_score = -1.0
-    best_datetime = datetime.min
+    scored_candidates = []
+    item_tokens = _tokenize_match_text(item_text)
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -2300,16 +2675,28 @@ def _pick_optional_candidate(
         score = _score_optional_candidate(
             entry, field, query_text, item_text, category_text
         )
+        entry_item_tokens = _tokenize_match_text(str(entry.get("item") or ""))
+        item_overlap = _jaccard_similarity(item_tokens, entry_item_tokens)
         entry_datetime = parse_stored_datetime(entry.get("datetime"))
-        if score > best_score or (
-            score == best_score and entry_datetime > best_datetime
-        ):
-            best_value = str(value).strip()
-            best_score = score
-            best_datetime = entry_datetime
+        scored_candidates.append(
+            (score, str(value).strip(), entry_datetime, item_overlap)
+        )
 
-    if best_value is None:
+    if not scored_candidates:
         return None, 0.0
+
+    # If we have an explicit item in query, prefer candidates with strongest
+    # item overlap (e.g., rice -> dmart over vegetables -> bigbazaar).
+    if field == "merchant" and item_tokens:
+        max_item_overlap = max(c[3] for c in scored_candidates)
+        if max_item_overlap >= 0.20:
+            scored_candidates = [
+                c for c in scored_candidates if c[3] >= max_item_overlap - 1e-6
+            ]
+
+    scored_candidates.sort(key=lambda x: (x[0], x[2]), reverse=True)
+    best_score, best_value, _, _ = scored_candidates[0]
+
     return best_value, best_score
 
 
@@ -2375,8 +2762,9 @@ def retrieve_assumptions(
     extracted: dict, target_collection=None, intent_override: Optional[str] = None
 ) -> dict:
     try:
-        active_collection = target_collection or collection
-        if active_collection is None or embed_model is None:
+        active_collection = target_collection or ensure_collection()
+        model = ensure_embed_model()
+        if active_collection is None or model is None:
             return {
                 "assumptions": {},
                 "retrieval_stage": "semantic_fallback",
@@ -2462,7 +2850,7 @@ def retrieve_assumptions(
                 query_parts.append(str(item.get("item")).strip())
             query_parts.append(anchor_value)
             stage1_query = " ".join(query_parts)
-            stage1_embedding = embed_model.encode(stage1_query).tolist()
+            stage1_embedding = model.encode(stage1_query).tolist()
             where_clause = {"$and": [{"intent": intent}, {anchor_field: anchor_value}]}
             try:
                 stage1 = active_collection.query(
@@ -2576,10 +2964,10 @@ def retrieve_assumptions(
             parts.append(str(item.get("payment_method")).strip())
 
         stage2_query = " ".join(parts)
-        stage2_embedding = embed_model.encode(stage2_query).tolist()
+        stage2_embedding = model.encode(stage2_query).tolist()
         stage2 = active_collection.query(
             query_embeddings=[stage2_embedding],
-            n_results=min(8, count),
+            n_results=min(20, count),
             where={"intent": intent},
             include=["metadatas", "distances"],
         )
@@ -2675,9 +3063,37 @@ def retrieve_assumptions(
 
         if intent == "income":
             stage2_fields = ["source", "payment_method", "payer"]
+            assumptions = _majority_vote(filtered, stage2_fields)
         else:
-            stage2_fields = ["merchant", "payment_method"]
-        assumptions = _majority_vote(filtered, stage2_fields)
+            # Expense suggestions use item/category-aware ranking to avoid recency bias.
+            assumptions = {}
+            item_text = str(item.get("item") or "")
+            category_text = inferred_query_category or str(item.get("category") or "")
+
+            merchant_value, merchant_score = _pick_optional_candidate(
+                filtered,
+                "merchant",
+                query_text,
+                item_text,
+                category_text,
+            )
+            if merchant_value and merchant_score >= 0.52:
+                assumptions["merchant"] = merchant_value
+                assumptions["merchant_confidence"] = round(min(1.0, merchant_score), 3)
+
+            payment_value, payment_score = _pick_optional_candidate(
+                filtered,
+                "payment_method",
+                query_text,
+                item_text,
+                category_text,
+            )
+            if payment_value and payment_score >= 0.45:
+                assumptions["payment_method"] = payment_value
+                assumptions["payment_method_confidence"] = round(
+                    min(1.0, payment_score), 3
+                )
+
         return {
             "assumptions": assumptions,
             "retrieval_stage": "semantic_fallback",
@@ -2727,6 +3143,7 @@ def detect_explicit_fields(user_input: str, data: dict) -> set[str]:
     - payment_method: detect directly from input text pattern (not from item value),
       so if RAG previously filled it but user didn't say it, it won't be marked explicit.
     - category: only flag when the category keyword appears in the raw input.
+    - bill_no: detect from receipt/invoice/bill patterns in user input.
     """
     explicit = set()
     text = (user_input or "").lower()
@@ -2743,6 +3160,14 @@ def detect_explicit_fields(user_input: str, data: dict) -> set[str]:
             for w in ["today", "yesterday", "this week", "last week", "this month"]
         ) or re.search(r"\b\d{1,2}[\/\-]\d{1,2}\b", text):
             explicit.add("datetime")
+
+    # Bill number — if bill/receipt pattern is in the user input
+    if re.search(
+        r"\b(?:bill|invoice|receipt|reciept|recipt|receit|txn|transaction|order|#)\s*(?:no|num|number|#|id)?[:\s]*[A-Za-z0-9\-\/]+",
+        text,
+        re.IGNORECASE,
+    ):
+        explicit.add("bill_no")
 
     # Payment method — check the raw text, not the item value
     # (RAG might have pre-filled item["payment_method"] from a past entry)
@@ -3378,8 +3803,9 @@ def save_to_db(entry: dict):
     safe_item = dict(cleaned_item)
     safe_entry["items"] = [safe_item]
     text = build_embed_text(safe_entry)
-
-    embedding = embed_model.encode(text).tolist()
+    active_collection = ensure_collection()
+    model = ensure_embed_model()
+    embedding = model.encode(text).tolist() if model is not None else None
 
     # Only store fields with real values — skip None/empty to avoid
     # false-positive where-clause matches and noisy debug output.
@@ -3406,9 +3832,12 @@ def save_to_db(entry: dict):
     }
 
     tx_id = str(uuid.uuid4())
-    collection.add(
-        documents=[text], metadatas=[flat], embeddings=[embedding], ids=[tx_id]
-    )
+    if embedding is not None:
+        active_collection.add(
+            documents=[text], metadatas=[flat], embeddings=[embedding], ids=[tx_id]
+        )
+    else:
+        active_collection.add(documents=[text], metadatas=[flat], ids=[tx_id])
     return tx_id
 
 
@@ -3476,39 +3905,31 @@ async def chat(req: ChatRequest):
 
         # "no"/"n"/"nope" means SKIP when no suggestion is showing.
         # "no"/"n"/"nope" means REJECT when a suggestion is showing.
-        is_skip = answer_lower in {"skip", "s", "-", "none", "no value"} or (
-            answer_lower in {"no", "n", "nope"} and not has_active_suggestion
+        is_skip = is_skip_answer(answer) or (
+            is_negative_answer(answer) and not has_active_suggestion
         )
 
         # Detect yes — accept the RAG suggestion
-        is_yes = answer_lower in {
-            "yes",
-            "y",
-            "yeah",
-            "yep",
-            "correct",
-            "right",
-            "ok",
-            "okay",
-            "sure",
-            "✓",
-        }
+        is_yes = is_affirmative_answer(answer) or answer_lower in {"sure", "✓"}
 
         # Detect no — reject suggestion, ask for correct value as plain followup
         is_no = (
-            answer_lower
-            in {
-                "no",
-                "n",
-                "nope",
-                "wrong",
-                "incorrect",
-                "not",
-                "x",
-                "✗",
-            }
-            and has_active_suggestion
-        )
+            is_negative_answer(answer) or answer_lower in {"not", "x", "✗"}
+        ) and has_active_suggestion
+
+        # "no cash" on a payment-method suggestion should be treated as
+        # a correction value, not a rejection-only response.
+        if (
+            has_active_suggestion
+            and field == "payment_method"
+            and re.match(r"^no\s+", answer_lower)
+        ):
+            candidate_method = re.sub(r"^no\s+", "", answer_lower).strip()
+            if normalize_payment_method(candidate_method):
+                answer = candidate_method
+                answer_lower = candidate_method.lower()
+                is_no = False
+                is_skip = False
 
         if is_skip:
             # Revert manual bypass of merge_followup_answer for skip, let it process properly
@@ -3578,23 +3999,80 @@ async def chat(req: ChatRequest):
     # ── Safety net: correct obviously wrong categories before RAG lookup
     # This prevents Groceries category on medicine/tablet queries from
     # poisoning the RAG category guard and blocking Health suggestions
-    item_for_correction = extracted.get("items", [{}])[0] if extracted.get("items") else {}
+    item_for_correction = (
+        extracted.get("items", [{}])[0] if extracted.get("items") else {}
+    )
     current_cat = str(item_for_correction.get("category") or "").strip().lower()
     query_lower_correction = req.message.lower()
 
     STRONG_CATEGORY_OVERRIDES = {
-        "health": ["tablet", "tablets", "medicine", "medicines", "supplement",
-                    "supplements", "vitamin", "vitamins", "gym", "doctor",
-                    "hospital", "pharmacy", "clinic", "pills", "capsule"],
-        "transport": ["petrol", "diesel", "fuel", "cab", "uber", "ola",
-                      "rapido", "metro", "bus", "train", "flight", "toll",
-                      "parking", "auto rickshaw"],
-        "entertainment": ["netflix", "spotify", "hotstar", "prime", "movie",
-                          "cinema", "pvr", "inox", "subscription", "gaming"],
-        "bills": ["electricity", "wifi", "internet", "mobile recharge",
-                  "water bill", "gas bill", "broadband", "recharge"],
-        "shopping": ["sneakers", "shoes", "shirt", "tshirt", "jeans",
-                     "dress", "jacket", "watch", "bag", "kurta"],
+        "health": [
+            "tablet",
+            "tablets",
+            "medicine",
+            "medicines",
+            "supplement",
+            "supplements",
+            "vitamin",
+            "vitamins",
+            "gym",
+            "doctor",
+            "hospital",
+            "pharmacy",
+            "clinic",
+            "pills",
+            "capsule",
+        ],
+        "transport": [
+            "petrol",
+            "diesel",
+            "fuel",
+            "cab",
+            "uber",
+            "ola",
+            "rapido",
+            "metro",
+            "bus",
+            "train",
+            "flight",
+            "toll",
+            "parking",
+            "auto rickshaw",
+        ],
+        "entertainment": [
+            "netflix",
+            "spotify",
+            "hotstar",
+            "prime",
+            "movie",
+            "cinema",
+            "pvr",
+            "inox",
+            "subscription",
+            "gaming",
+        ],
+        "bills": [
+            "electricity",
+            "wifi",
+            "internet",
+            "mobile recharge",
+            "water bill",
+            "gas bill",
+            "broadband",
+            "recharge",
+        ],
+        "shopping": [
+            "sneakers",
+            "shoes",
+            "shirt",
+            "tshirt",
+            "jeans",
+            "dress",
+            "jacket",
+            "watch",
+            "bag",
+            "kurta",
+        ],
     }
 
     for correct_cat, keywords in STRONG_CATEGORY_OVERRIDES.items():
@@ -3631,6 +4109,7 @@ async def save(req: SaveRequest):
 @app.post("/analytics")
 async def analytics(req: AnalyticsRequest):
     try:
+        active_collection = ensure_collection()
         # Pre-filter at DB level when possible to avoid loading all rows.
         where_conditions = []
         qt = req.query_type
@@ -3650,11 +4129,11 @@ async def analytics(req: AnalyticsRequest):
             where_clause = {"$and": where_conditions}
 
         if where_clause:
-            data = collection.get(where=where_clause, include=["metadatas"]).get(
+            data = active_collection.get(where=where_clause, include=["metadatas"]).get(
                 "metadatas", []
             )
         else:
-            data = collection.get(include=["metadatas"]).get("metadatas", [])
+            data = active_collection.get(include=["metadatas"]).get("metadatas", [])
     except Exception:
         data = []
 
@@ -3756,10 +4235,11 @@ async def analytics(req: AnalyticsRequest):
 @app.get("/transactions")
 async def transactions():
     try:
-        count = collection.count()
+        active_collection = ensure_collection()
+        count = active_collection.count()
         if count == 0:
             return {"transactions": []}
-        data = collection.get(include=["metadatas"])
+        data = active_collection.get(include=["metadatas"])
         items = []
         for ds_id, meta in zip(data["ids"], data["metadatas"]):
             meta["id"] = ds_id
@@ -3772,7 +4252,8 @@ async def transactions():
 @app.delete("/transactions/{tx_id}")
 async def delete_transaction(tx_id: str):
     try:
-        collection.delete(ids=[tx_id])
+        active_collection = ensure_collection()
+        active_collection.delete(ids=[tx_id])
         return {"status": "deleted"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -3783,22 +4264,16 @@ async def debug(req: ChatRequest):
     """Returns full extraction + RAG context — use to diagnose failures."""
     past = retrieve_context(req.message)
 
-    raw_output = {}
+    raw_output = {"source": "llama_cpp" if llm is not None else "heuristic_fallback"}
     try:
-        prompt = build_extraction_prompt(req.message, past)
-        response = ollama.chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            format="json",
-            options=OLLAMA_FAST_OPTIONS,
-        )
-        raw_text = response["message"]["content"].strip()
-        repaired = repair_json_string(raw_text)
-        raw_output = json.loads(repaired)
+        extracted = extract_fields(req.message, past)
     except Exception as e:
-        raw_output = {"error": str(e)}
+        raw_output = {"error": str(e), "source": "heuristic_fallback"}
+        extracted = normalize_model_output(
+            {"intent": infer_transaction_intent(req.message), "items": [empty_item()]},
+            req.message,
+        )
 
-    extracted = normalize_model_output(raw_output, req.message)
     extracted["retrieved_context"] = past
     extracted["original_query"] = req.message
 
@@ -3843,6 +4318,8 @@ async def debug(req: ChatRequest):
 
     return {
         "raw_model_output": raw_output,
+        "heuristic_intent_probe": infer_transaction_intent(req.message),
+        "heuristic_source_probe": infer_income_source(req.message),
         "normalized_output": extracted,
         "raw_extracted": extracted,
         "after_autofill": enriched,
@@ -3867,7 +4344,14 @@ async def debug(req: ChatRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL}
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "model_path": MODEL_PATH,
+        "backend": "llama_cpp" if llm is not None else "heuristic_fallback",
+        "intent_probe_gym": infer_transaction_intent("gym membership 1000 today"),
+        "intent_probe_repay": infer_transaction_intent("Rahul paid me back 2000 today"),
+    }
 
 
 @app.get("/favicon.ico", include_in_schema=False)

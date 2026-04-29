@@ -1,6 +1,7 @@
 import { TransactionDraft } from "@/types/chat";
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() || "http://127.0.0.1:8000";
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
+const FALLBACK_API_BASE_URLS = ["http://127.0.0.1:8000", "http://127.0.0.1:9002"];
 
 type BackendItem = {
   amount?: number | string | null;
@@ -30,20 +31,36 @@ export type BackendChatResponse = {
 };
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE_URL}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
-  });
+  const baseUrls = API_BASE_URL ? [API_BASE_URL] : FALLBACK_API_BASE_URLS;
+  let lastError: unknown;
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`API ${res.status}: ${body || res.statusText}`);
+  for (const baseUrl of baseUrls) {
+    try {
+      const res = await fetch(`${baseUrl}${path}`, {
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init?.headers || {}),
+        },
+      });
+
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`API ${res.status}: ${body || res.statusText}`);
+      }
+
+      return res.json() as Promise<T>;
+    } catch (error) {
+      lastError = error;
+      continue;
+    }
   }
 
-  return res.json() as Promise<T>;
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+
+  throw new Error("API request failed");
 }
 
 function parseAmount(value: number | string | null | undefined): number | null {
@@ -154,10 +171,26 @@ export async function saveTransaction(entry: Record<string, unknown>): Promise<v
   });
 }
 
-export async function fetchTransactions(): Promise<TransactionDraft[]> {
-  const data = await apiFetch<{ transactions: Array<Record<string, string>> }>("/transactions", {
-    method: "GET",
+export async function deleteTransaction(id: string): Promise<void> {
+  await apiFetch<{ status: string }>(`/transactions/${encodeURIComponent(id)}`, {
+    method: "DELETE",
   });
+}
+
+export async function fetchTransactions(): Promise<TransactionDraft[]> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 5000);
+  let data: { transactions: Array<Record<string, string>> };
+  try {
+    data = await apiFetch<{ transactions: Array<Record<string, string>> }>("/transactions", {
+      method: "GET",
+      signal: controller.signal,
+    });
+  } catch {
+    return [];
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 
   return (data.transactions || []).map((row) => {
     const type = (row.intent === "income" ? "income" : "expense") as TransactionDraft["type"];
@@ -165,6 +198,7 @@ export async function fetchTransactions(): Promise<TransactionDraft[]> {
     const date = toDateOnly(row.datetime);
 
     return {
+      id: row.id || undefined,
       type,
       amount,
       category: type === "expense" ? (row.category || undefined) : undefined,

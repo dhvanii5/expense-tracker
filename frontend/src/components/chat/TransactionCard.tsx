@@ -539,7 +539,7 @@ export function TransactionCard({
               />
               <FieldRow
                 label="Remarks"
-                value={draft.remarks}
+                value={draft.remarks ?? 'Not provided'}
                 assumed={isAssumed('remarks')}
               />
             </div>

@@ -21,7 +21,6 @@ function formatCurrency(amount: number, currency?: string | null): string {
 }
 
 export function RecentTransactions({ transactions, onDelete }: Props) {
-  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   function buildDetails(t: TransactionDraft) {
@@ -33,7 +32,7 @@ export function RecentTransactions({ transactions, onDelete }: Props) {
       { label: 'Payment', value: t.paymentMethod },
       { label: 'Date', value: t.date },
       { label: 'Bill No', value: t.bill_no },
-      { label: 'Notes', value: t.remarks },
+      { label: 'Remarks', value: t.remarks || 'Not provided' },
       { label: 'Transaction ID', value: t.id },
     ].filter((entry) => !!entry.value);
   }
@@ -70,6 +69,7 @@ export function RecentTransactions({ transactions, onDelete }: Props) {
           // Primary label: source/category; subtitle: item or payer/merchant, then date
           const primaryLabel = isIncome ? (t.source ?? '—') : (t.category ?? '—');
           const subtitle = t.item || (isIncome ? t.payer : t.merchant) || t.date || '';
+          const remarksPreview = t.remarks?.trim() || 'Not provided';
           const details = buildDetails(t);
 
           return (
@@ -93,10 +93,28 @@ export function RecentTransactions({ transactions, onDelete }: Props) {
                   {subtitle && (
                     <p className="text-[10px] text-muted-foreground truncate">{subtitle}</p>
                   )}
+                  <p className="text-[10px] text-muted-foreground truncate">Remarks: {remarksPreview}</p>
                 </div>
                 <span className={`text-sm font-semibold shrink-0 ${isIncome ? 'text-income' : 'text-expense'}`}>
                   {isIncome ? '+' : '-'}{formatCurrency(t.amount!, t.currency)}
                 </span>
+                {onDelete && t.id && (
+                  <button
+                    type="button"
+                    className="shrink-0 p-1 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const ok = window.confirm('Delete this transaction permanently?');
+                      if (ok) {
+                        onDelete(t.id);
+                      }
+                    }}
+                    aria-label="Delete transaction"
+                    title="Delete transaction"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
                 <button
                   type="button"
                   className="shrink-0 p-1 rounded-md text-muted-foreground hover:bg-muted"
@@ -109,45 +127,6 @@ export function RecentTransactions({ transactions, onDelete }: Props) {
                   {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                 </button>
               </div>
-              {onDelete && t.id && (
-                <div className="px-3 pb-2">
-                  {deletingId === t.id ? (
-                    <div className="flex items-center gap-2 shrink-0 justify-end">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onDelete(t.id!);
-                          setDeletingId(null);
-                        }}
-                        className="text-[10px] font-medium px-2 py-1 bg-destructive text-destructive-foreground rounded hover:opacity-90 transition-opacity"
-                      >
-                        Confirm
-                      </button>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setDeletingId(null);
-                        }}
-                        className="text-[10px] font-medium px-2 py-1 bg-muted text-muted-foreground rounded hover:bg-muted/80 transition-colors"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex justify-end">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setDeletingId(t.id!);
-                        }}
-                        className="shrink-0 p-1 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded-md transition-colors"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
 
               {isExpanded && (
                 <div className="mx-3 mb-2 rounded-md border bg-muted/30 px-3 py-2 space-y-1.5">
