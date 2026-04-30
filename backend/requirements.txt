@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-chromadb
-sentence-transformers
-ollama
-pydantic
-llama-cpp-python

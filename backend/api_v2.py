@@ -47,7 +47,12 @@ async def debug(req: main.ChatRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "api_v2", "model": main.MODEL}
+    return {
+        "status": "ok",
+        "service": "api_v2",
+        "model": main.MODEL_NAME,
+        "model_path": str(main.MODEL_PATH),
+    }
 
 
 if __name__ == "__main__":

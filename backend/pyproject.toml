@@ -1,0 +1,25 @@
+[project]
+name = "expense-tracker-backend"
+version = "0.1.0"
+description = "FastAPI backend for the expense tracker application"
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb",
+    "fastapi",
+    "pydantic",
+    "sentence-transformers",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+local-llm = [
+    "llama-cpp-python",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false

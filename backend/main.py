@@ -4856,3 +4856,12 @@ async def root():
         "service": "expense-backend",
         "message": "API is running. Use /chat, /save, /analytics, /transactions, /debug, /health",
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "9002"))
+    reload = os.getenv("RELOAD", "false").lower() == "true"
+    uvicorn.run("main:app", host=host, port=port, reload=reload)
