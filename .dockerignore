@@ -17,4 +17,3 @@ backend/finance_memory
 **/*.pyo
 **/*.pyd
 
-README.md

@@ -7,23 +7,45 @@ services:
     container_name: expense-backend
     restart: unless-stopped
     ports:
-      - "${PORT:-9002}:9002"
+      - "${BACKEND_PORT:-9002}:9002"
     environment:
       HOST: "0.0.0.0"
       PORT: "9002"
       CHROMA_DB_PATH: "/data/finance_memory"
-      LLAMA_SERVER_URL: "http://host.docker.internal:8080"
-      LLAMA_SERVER_MODEL: "qwen3b-dhvani-q8_0.gguf"
-      LLAMA_SERVER_EMBEDDINGS_URL: "http://host.docker.internal:8080/embedding"
-      LLAMA_SERVER_COMPLETIONS_URL: "http://host.docker.internal:8080/completion"
+      LLAMA_SERVER_URL: "${LLAMA_SERVER_URL:-http://host.docker.internal:8080}"
+      LLAMA_SERVER_MODEL: "${LLAMA_SERVER_MODEL:-qwen3b-dhvani-q8_0.gguf}"
+      LLAMA_SERVER_EMBEDDINGS_URL: "${LLAMA_SERVER_EMBEDDINGS_URL:-http://host.docker.internal:8080/embedding}"
+      LLAMA_SERVER_COMPLETIONS_URL: "${LLAMA_SERVER_COMPLETIONS_URL:-http://host.docker.internal:8080/completion}"
     volumes:
       - chroma-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9002/health')"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:9002/health')",
+        ]
       interval: 30s
       timeout: 10s
       start_period: 60s
       retries: 3
+
+  expense-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: "${VITE_API_BASE_URL:-http://localhost:9002}"
+    image: expense-frontend:latest
+    container_name: expense-frontend
+    restart: unless-stopped
+    depends_on:
+      - expense-backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
 
 volumes:
   chroma-data:
