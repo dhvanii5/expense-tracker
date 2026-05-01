@@ -14,13 +14,9 @@ Install and sync the backend environment with `uv`:
 uv sync --directory backend
 ```
 
-`llama-cpp-python` is not installed by default. On Windows, `uv` may fall back to a source build, which requires a native C/C++ toolchain such as Visual Studio Build Tools.
+The default backend install is API-only. The backend talks to `llama-server` over HTTP for both completions and embeddings.
 
-If you want to enable the local GGUF model path in `main.py`, install the optional extra with a supported environment:
-
-```bash
-uv sync --directory backend --extra local-llm
-```
+Run a separate `llama-server` process and point the backend at it with `LLAMA_SERVER_URL` or the explicit completion and embedding URLs (`LLAMA_SERVER_COMPLETIONS_URL`, `LLAMA_SERVER_EMBEDDINGS_URL`).
 
 Run the backend directly:
 
@@ -40,6 +36,85 @@ If you prefer explicit `uvicorn` commands during development:
 uv run --directory backend uvicorn main:app --reload --host 0.0.0.0 --port 9002
 ```
 
+## Docker Deployment
+
+This project can be deployed as a backend-only container on port `9002`.
+
+Quick start from the repository root:
+
+```bash
+docker compose up -d
+```
+
+With `llama-server` running separately:
+
+```bash
+LLAMA_SERVER_URL=http://host.docker.internal:8080 docker compose up -d
+```
+
+Important size note: the local GGUF model in `model/qwen3b-dhvani-q8_0.gguf` is about `3.28 GB` by itself. Do not bake that file into this backend image. Keep it on the server filesystem and let `llama-server` load it directly.
+
+Build from the repository root:
+
+```bash
+docker build -f backend/Dockerfile -t expense-tracker-api .
+```
+
+Run it:
+
+```bash
+docker run --rm -p 9002:9002 --name expense-tracker-api expense-tracker-api
+```
+
+Run it against a separately hosted `llama-server`:
+
+```bash
+docker run --rm -p 9002:9002 \
+  -e LLAMA_SERVER_URL=http://host.docker.internal:8080 \
+  --name expense-tracker-api \
+  expense-tracker-api
+```
+
+Persist Chroma data across restarts with a bind mount or named volume:
+
+```bash
+docker run --rm -p 9002:9002 \
+  -v expense_tracker_data:/app/finance_memory \
+  --name expense-tracker-api \
+  expense-tracker-api
+```
+
+The repository also includes a root `docker-compose.yml` that mounts:
+
+- `chroma-data` at `/data`
+
+`main.py` now respects `CHROMA_DB_PATH`, so the default compose path is:
+
+```text
+/data/finance_memory
+```
+
+### Minimum Files Needed For Deployment
+
+- `backend/Dockerfile`
+- `backend/requirements.deploy.txt`
+- `backend/api_v2.py`
+- `backend/main.py`
+- `backend/time_parser.py`
+
+Optional at deploy time:
+
+- `backend/finance_memory/` if you want to ship existing stored transaction memory
+- reachable `llama-server` endpoint for LLM-backed extraction and embedding generation
+- future environment variables for API keys when you add hosted model providers
+
+Not needed for this backend container:
+
+- `frontend/`
+- `dataset/`
+- `model/` inside the backend image build context; the GGUF should be used by `llama-server`, not by this container
+- local virtualenv folders such as `backend/.venv/`
+
 ## Base URL
 
 If you run the server locally on port 9002, the base URL is:
@@ -55,10 +130,10 @@ If you use a different host or port, replace it in the examples below.
 - All endpoints accept and return JSON.
 - CORS is enabled for browser clients.
 - `chat` is the main endpoint used by the frontend.
-- `health` is useful for checking that the server and local model are loaded.
+- `health` is useful for checking that the server is running and whether `llama-server` is configured.
 - Date/time parsing is handled in `time_parser.py` inside this folder.
-- Local Chroma data is stored under `backend/finance_memory/`.
-- The local model file path defaults to `../model/qwen3b-dhvani-q8_0.gguf`.
+- Local Chroma data is stored under `backend/finance_memory/` by default, or `CHROMA_DB_PATH` when set.
+- Configure `LLAMA_SERVER_URL` to enable HTTP calls to a separate `llama-server` process.
 
 ## Endpoints
 
@@ -209,7 +284,7 @@ Example:
 
 ### `GET /health`
 
-Check if the backend is alive and whether the model is loaded.
+Check if the backend is alive and whether `llama-server` is configured.
 
 Example response:
 
@@ -218,7 +293,7 @@ Example response:
   "status": "ok",
   "service": "api_v2",
   "model": "qwen3b-dhvani-q8_0.gguf",
-  "model_path": "D:\\SLM\\expense-tracker\\model\\qwen3b-dhvani-q8_0.gguf"
+  "llama_server_url": "http://host.docker.internal:8080"
 }
 ```
 

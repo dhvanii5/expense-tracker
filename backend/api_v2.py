@@ -50,8 +50,8 @@ async def health():
     return {
         "status": "ok",
         "service": "api_v2",
-        "model": main.MODEL_NAME,
-        "model_path": str(main.MODEL_PATH),
+        "model": main.LLAMA_SERVER_MODEL or None,
+        "llama_server_url": main.LLAMA_SERVER_URL or None,
     }
 
 

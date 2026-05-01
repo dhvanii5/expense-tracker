@@ -7,10 +7,13 @@ import logging
 import json
 import re
 import uuid
+import copy
 from datetime import datetime, timedelta
 import math
 import time
 import os
+import urllib.request
+import urllib.error
 import warnings
 import traceback
 from pathlib import Path
@@ -124,6 +127,14 @@ app.add_middleware(
 MODEL_PATH = MODEL_DIR / "qwen3b-dhvani-q8_0.gguf"
 MODEL_NAME = MODEL_PATH.name
 CHATML_TEMPLATE = "<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+
+# Llama server settings for remote inference
+LLAMA_SERVER_URL = os.getenv("LLAMA_SERVER_URL", "").rstrip("/")
+LLAMA_SERVER_COMPLETIONS_URL = os.getenv(
+    "LLAMA_SERVER_COMPLETIONS_URL",
+    f"{LLAMA_SERVER_URL}/completion" if LLAMA_SERVER_URL else "",
+).strip()
+LLAMA_SERVER_MODEL = os.getenv("LLAMA_SERVER_MODEL", MODEL_NAME)
 
 # Ephemeral last follow-up storage for clients that omit session_data.
 # This is a best-effort fallback for single-user/dev scenarios.
@@ -241,8 +252,8 @@ INCOME_SOURCE_LIKE_TERMS = {
 }
 
 # Minimum semantic similarity for keyword-boosted retrieval.
-ASSUMPTION_SIMILARITY_THRESHOLD = 0.55
-SEMANTIC_ONLY_THRESHOLD = 0.35
+ASSUMPTION_SIMILARITY_THRESHOLD = 0.40
+SEMANTIC_ONLY_THRESHOLD = 0.50
 
 # ── FIX 2: Canonical null-like sentinel set (used everywhere)
 FILLER_VALUES = {
@@ -2196,21 +2207,39 @@ def extract_fields(user_input: str, context: list = []) -> dict:
 
     try:
         t1 = time.time()
-        if llm is None:
-            raise RuntimeError("Local LLM not initialized")
-
-        response = llm(
-            chat_prompt,
-            max_tokens=128,
-            temperature=0.0,
-            stop=["<|im_end|>"],
-            echo=False,
-        )
-        t2 = time.time()
-        print(f"Local LLM response time: {t2 - t1:.2f} seconds")
-        raw = response["choices"][0]["text"].strip()
+        if llm is not None:
+            response = llm(
+                chat_prompt,
+                max_tokens=128,
+                temperature=0.0,
+                stop=["<|im_end|>"],
+                echo=False,
+            )
+            raw = response["choices"][0]["text"].strip()
+            print(f"Local LLM response time: {time.time() - t1:.2f} seconds")
+        elif LLAMA_SERVER_COMPLETIONS_URL:
+            # Fallback to remote llama-server
+            payload = json.dumps({
+                "prompt": chat_prompt,
+                "n_predict": 128,
+                "temperature": 0.0,
+                "stop": ["<|im_end|>"],
+                "cache_prompt": True
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                LLAMA_SERVER_COMPLETIONS_URL,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                raw = body.get("content", "").strip()
+            print(f"Remote LLM response time: {time.time() - t1:.2f} seconds")
+        else:
+            raise RuntimeError("No LLM (local or remote) available")
     except Exception as e:
-        print(f"Local LLM failed: {e}")
+        print(f"LLM extraction failed: {e}")
         return normalize_model_output(
             {"intent": infer_transaction_intent(user_input), "items": [empty_item()]},
             user_input,
@@ -2374,6 +2403,7 @@ def merge_followup_answer(existing: dict, answer: str, field: str) -> dict:
                 existing["intent"] = "unsupported"
         return existing
 
+    existing = copy.deepcopy(existing)
     if not existing.get("items"):
         existing["items"] = [empty_item()]
     item = existing["items"][0]
@@ -2560,12 +2590,15 @@ def parse_stored_datetime(value: Optional[str]) -> datetime:
 def to_similarity(distance: Optional[float]) -> float:
     """Convert ChromaDB cosine distance to similarity score.
 
-    ChromaDB cosine distance is in [0, 2] where 0 = identical.
-    Similarity = 1 - (distance / 2), clamped to [0, 1].
+    ChromaDB cosine distance is 1.0 - cosine_similarity.
+    Similarity = 1.0 - distance, clamped to [0, 1].
     """
     try:
         d = float(distance)
-        return max(0.0, min(1.0, 1.0 - d / 2.0))
+        # ChromaDB 'cosine' distance is 1 - cos_sim. So cos_sim = 1 - d.
+        raw_sim = max(0.0, min(1.0, 1.0 - d))
+        # Apply steep power curve to separate tight generative embedding clusters.
+        return float(raw_sim ** 15)
     except Exception:
         return 0.0
 
@@ -4336,7 +4369,7 @@ async def chat(req: ChatRequest):
             # even if the previous draft was still waiting on an optional field.
             has_valid_session_shape = False
         elif not is_query_like_message(req.message, is_followup=True):
-            session = dict(req.session_data)
+            session = copy.deepcopy(dict(req.session_data))
             field = req.followup_field
             intent = str(session.get("intent") or "").strip().lower()
             optional_field_set = {
@@ -4408,23 +4441,11 @@ async def chat(req: ChatRequest):
                 # Revert manual bypass of merge_followup_answer for skip, let it process properly
                 # so the field gets marked in skipped_optional_fields.
                 session = merge_followup_answer(session, answer, field)
-                try:
-                    print(f"DEBUG merged skip session_after={session.get('items')}")
-                except Exception:
-                    pass
-
             elif (is_yes or is_rag_accepted) and not is_empty(rag_suggestion):
                 # Accept RAG suggestion
                 session = merge_followup_answer(session, str(rag_suggestion), field)
-                try:
-                    print(f"DEBUG merged yes session_after={session.get('items')}")
-                except Exception:
-                    pass
-
             elif is_no and not is_empty(rag_suggestion):
                 # User rejected suggestion — ask plain followup for this field
-
-                # Clear suggestion for this field so it isn't asked again
                 rejected = session.get("rejected_optional_suggestion_fields")
                 if not isinstance(rejected, list):
                     rejected = []
@@ -4432,14 +4453,12 @@ async def chat(req: ChatRequest):
                     rejected.append(field)
                 session["rejected_optional_suggestion_fields"] = rejected
 
-                # Clear _cosine / _similarity on all entries so suggestion is not shown again
                 retrieved = session.get("retrieved_context") or []
                 for e in retrieved:
                     e["_cosine"] = None
-                    e["_similarity"] = 0.0  # force below threshold
+                    e["_similarity"] = 0.0
                 session["retrieved_context"] = retrieved
 
-                # Return plain followup question for same field with no suggestion
                 plain_question = generate_followup(session, field)
                 return {
                     "status": "followup",
@@ -4447,38 +4466,27 @@ async def chat(req: ChatRequest):
                     "followup_field": field,
                     "assumption_value": None,
                     "assumption_confidence": None,
-                    "retrieval_stage": session.get(
-                        "retrieval_stage", "semantic_fallback"
-                    ),
+                    "retrieval_stage": session.get("retrieval_stage", "semantic_fallback"),
                     "followup_options": ["Skip"],
                     "is_optional_followup": True,
                     "extracted": session,
                     "autofilled_fields": session.get("autofilled_fields", []),
                 }
+            else:
+                # User typed a real value
+                if field == "payment_method":
+                    answer = normalize_payment_method(answer) or answer
+                session = merge_followup_answer(session, answer, field)
 
-        else:
-            # User typed a real value
-            if field == "payment_method":
-                answer = normalize_payment_method(answer) or answer
-            session = merge_followup_answer(session, answer, field)
-            try:
-                print(f"DEBUG merged real session_after={session.get('items')}")
-            except Exception:
-                pass
-
-        # Always preserve original retrieved_context — never overwrite with empty
-        existing_context = session.get("retrieved_context")
-        if isinstance(existing_context, list) and existing_context:
-            past = existing_context
-        else:
-            past = []
-        session["retrieved_context"] = past
-        original_query = (
-            req.session_data.get("original_query", "")
-            if isinstance(req.session_data, dict)
-            else ""
-        )
-        return _prepare_and_record(session, original_query, past)
+            # Always preserve original retrieved_context — never overwrite with empty
+            existing_context = session.get("retrieved_context")
+            if isinstance(existing_context, list) and existing_context:
+                past = existing_context
+            else:
+                past = []
+            session["retrieved_context"] = past
+            original_query = session.get("original_query", req.message)
+            return _prepare_and_record(session, original_query, past)
 
     # Fresh input: extract -> RAG -> check
     extracted = extract_fields(req.message, [])
@@ -4834,13 +4842,20 @@ async def debug(req: ChatRequest):
 
 @app.get("/health")
 async def health():
+    active_backend = "heuristic_fallback"
+    if llm is not None:
+        active_backend = "llama_cpp_local"
+    elif LLAMA_SERVER_COMPLETIONS_URL:
+        active_backend = "llama_server_remote"
+
     return {
         "status": "ok",
-        "model": MODEL_NAME,
-        "model_path": MODEL_PATH,
-        "backend": "llama_cpp" if llm is not None else "heuristic_fallback",
+        "model": LLAMA_SERVER_MODEL or MODEL_NAME,
+        "model_path": MODEL_PATH if llm else "remote",
+        "backend": active_backend,
         "intent_probe_gym": infer_transaction_intent("gym membership 1000 today"),
         "intent_probe_repay": infer_transaction_intent("Rahul paid me back 2000 today"),
+        "llama_server_url": LLAMA_SERVER_URL or None,
     }
 
 

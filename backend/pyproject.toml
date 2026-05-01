@@ -7,11 +7,11 @@ dependencies = [
     "chromadb",
     "fastapi",
     "pydantic",
-    "sentence-transformers",
     "uvicorn",
 ]
 
 [project.optional-dependencies]
+
 local-llm = [
     "llama-cpp-python",
 ]

@@ -1,0 +1,10 @@
+# Web framework
+fastapi==0.115.9
+uvicorn[standard]==0.34.2
+pydantic==2.11.4
+
+# Vector DB
+chromadb==1.0.9
+
+# Utilities
+python-multipart==0.0.20
